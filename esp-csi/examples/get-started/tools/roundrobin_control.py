@@ -9,6 +9,7 @@ ESP-NOW broadcast for coordination, since ESP-NOW broadcasts aren't acknowledged
 and testing showed most were getting dropped under CSI-processing load.
 """
 
+import argparse
 import re
 import sys
 import time
@@ -18,7 +19,6 @@ import serial.tools.list_ports
 
 WCH_VID = 0x1A86
 BAUD = 921600
-ROUND_DURATION_S = 1.0
 BOOT_MAC_RE = re.compile(r'Board MAC ([0-9a-fA-F:]{17})')
 
 
@@ -56,6 +56,11 @@ def mac_hex(mac: str) -> str:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('-d', '--round-duration', type=float, default=1.0,
+                         help='Seconds each board holds the TX token before handoff (default: 1.0)')
+    args = parser.parse_args()
+
     boards = discover_boards()
     if len(boards) < 2:
         print(f'Found {len(boards)} board(s) -- need at least 2 (one TX, one RX). Exiting.')
@@ -63,7 +68,7 @@ def main():
 
     ports = list(boards.keys())
     print(f'\n{len(ports)} boards in the ring: {ports}')
-    print(f'Round duration: {ROUND_DURATION_S}s. Ctrl+C to stop.\n')
+    print(f'Round duration: {args.round_duration}s. Ctrl+C to stop.\n')
 
     current_idx = -1
     try:
@@ -78,7 +83,7 @@ def main():
                     board['serial'].write(f'RX {tx_mac_hex}\n'.encode())
 
             print(f'{time.strftime("%H:%M:%S")}  TX -> {tx_port} ({boards[tx_port]["mac"]})')
-            time.sleep(ROUND_DURATION_S)
+            time.sleep(args.round_duration)
     except KeyboardInterrupt:
         print('\nStopping.')
     finally:

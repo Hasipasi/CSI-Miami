@@ -29,6 +29,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <math.h>
 
 #include "nvs_flash.h"
 
@@ -43,6 +44,7 @@
 #include "led_strip.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #define STATUS_LED_GPIO 48
 
@@ -51,7 +53,12 @@
 #define CONFIG_ESP_NOW_PHYMODE              WIFI_PHY_MODE_HT40
 #define CONFIG_ESP_NOW_RATE                 WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_FORCE_GAIN                   0
-#define CONFIG_SEND_FREQUENCY               20    // CSI-trigger pings/sec while holding the token
+// CSI-trigger pings/sec while holding the token. Capped by UART bandwidth, not radio:
+// each CSI line is ~1215 bytes, and 921600 baud carries ~76 lines/sec. A board is RX
+// ~80% of the time, so ping rate R needs 0.8*R lines/sec -- R=100 demands ~97KB/s
+// against a ~90KB/s link, which saturates it and truncates/drops lines. 50 leaves ~40%
+// headroom. Raising this further needs a denser encoding (binary, or fewer subcarriers).
+#define CONFIG_SEND_FREQUENCY               50
 #define CONFIG_GAIN_CONTROL                  1     // all our boards are ESP32-S3
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
@@ -63,6 +70,15 @@ static const char *TAG = "csi_rr";
 static const uint8_t BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 static volatile bool is_tx = false;
+// When set (via the IDENT command), the LED is pinned to a fixed identify color and
+// role changes stop touching it -- lets a specific board be picked out physically on
+// the bench without pulling it out of the ring or reflashing it.
+static volatile bool ident_mode = false;
+// ets_printf is not atomic across tasks: CSI lines are printed from the WiFi task
+// while role markers are printed from the UART command task, and concurrent calls
+// interleave mid-line, corrupting both. That silently ate ~23% of ROLE_TX markers.
+// Every multi-line/multi-call print below must hold this.
+static SemaphoreHandle_t print_mux;
 static uint8_t tx_filter_mac[6] = {0}; // whichever MAC we should currently accept CSI from
 static led_strip_handle_t led_strip;
 static esp_timer_handle_t ping_timer;
@@ -91,19 +107,36 @@ static void init_led(void)
 static void become_tx(void)
 {
     is_tx = true;
-    set_led(0, 0, 40); // blue = holding the TX token
+    // Invalidate the CSI filter so stray/late packets from whoever we were
+    // previously told to receive from (which may not have processed its own
+    // "become RX" command yet) don't get recorded as if captured during our
+    // own TX span. No real board has an all-zero MAC, so nothing can match.
+    memset(tx_filter_mac, 0, sizeof(tx_filter_mac));
+    if (!ident_mode) {
+        set_led(0, 0, 40); // blue = holding the TX token
+    }
     esp_timer_stop(ping_timer); // ignored if not running
     ESP_ERROR_CHECK(esp_timer_start_periodic(ping_timer, 1000000 / CONFIG_SEND_FREQUENCY));
-    ESP_LOGI(TAG, "=== became TX ===");
+    // ets_printf, not ESP_LOGI: CSI records are emitted with ets_printf (straight to the
+    // UART FIFO) while ESP_LOGI goes through the VFS/driver buffer. Mixing the two lets
+    // them reorder under buffer pressure, which makes the host misjudge which side of a
+    // role change a record falls on. Same path == guaranteed ordering.
+    xSemaphoreTake(print_mux, portMAX_DELAY);
+    ets_printf("ROLE_TX\n");
+    xSemaphoreGive(print_mux);
 }
 
 static void become_rx(const uint8_t *peer_mac)
 {
     is_tx = false;
     memcpy(tx_filter_mac, peer_mac, 6);
-    set_led(40, 0, 0); // red = receiving
+    if (!ident_mode) {
+        set_led(40, 0, 0); // red = receiving
+    }
     esp_timer_stop(ping_timer); // ignored if not running
-    ESP_LOGI(TAG, "RX, filtering CSI for " MACSTR, MAC2STR(tx_filter_mac));
+    xSemaphoreTake(print_mux, portMAX_DELAY);
+    ets_printf("ROLE_RX," MACSTR "\n", MAC2STR(tx_filter_mac)); // ets_printf: see become_tx()
+    xSemaphoreGive(print_mux);
 }
 
 static void ping_timer_cb(void *arg)
@@ -150,6 +183,14 @@ static void uart_command_task(void *arg)
             } else {
                 ESP_LOGW(TAG, "bad RX command: '%s'", line);
             }
+        } else if (strcmp(line, "IDENT") == 0) {
+            ident_mode = true;
+            set_led(40, 20, 0); // orange -- physically identifies this board on the bench
+            ESP_LOGI(TAG, "IDENT on (LED pinned orange)");
+        } else if (strcmp(line, "IDENT OFF") == 0) {
+            ident_mode = false;
+            set_led(is_tx ? 0 : 40, 0, is_tx ? 40 : 0); // back to role color
+            ESP_LOGI(TAG, "IDENT off");
         } else if (line[0] != '\0') {
             ESP_LOGW(TAG, "unknown command: '%s'", line);
         }
@@ -160,6 +201,15 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
     if (!info || !info->buf) {
         ESP_LOGW(TAG, "<%s> wifi_csi_cb", esp_err_to_name(ESP_ERR_INVALID_ARG));
+        return;
+    }
+
+    // Never record while we ourselves hold the TX token. This is deliberately not just
+    // "tx_filter_mac is zeroed in become_tx()": promiscuous mode can loop a station's own
+    // outgoing frames back through this callback, and if that self-loopback happens to
+    // report info->mac as all-zero too, a zeroed filter would start matching it instead
+    // of blocking it. Checking is_tx directly has no such edge case.
+    if (is_tx) {
         return;
     }
 
@@ -191,21 +241,35 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     uint32_t rx_id = *(uint32_t *)(info->payload + 15);
     if (!s_count) {
         ESP_LOGI(TAG, "================ CSI RECV ================");
-        ets_printf("type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_format,len,first_word,data\n");
+        ets_printf("type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,ampdu_cnt,channel,secondary_channel,local_timestamp,ant,sig_len,rx_format,n_subcarriers,first_word,amplitude\n");
     }
 
-    ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+    // Held across the whole record: the line is emitted by many ets_printf calls, and
+    // without this a role marker from the command task lands in the middle of it.
+    xSemaphoreTake(print_mux, portMAX_DELAY);
+    ets_printf("CSI_AMP,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
                rx_id, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate, rx_ctrl->sig_mode,
                rx_ctrl->mcs, rx_ctrl->cwb, rx_ctrl->smoothing, rx_ctrl->not_sounding,
                rx_ctrl->aggregation, rx_ctrl->stbc, rx_ctrl->fec_coding, rx_ctrl->sgi,
                rx_ctrl->noise_floor, rx_ctrl->ampdu_cnt, rx_ctrl->channel, rx_ctrl->secondary_channel,
                rx_ctrl->timestamp, rx_ctrl->ant, rx_ctrl->sig_len, rx_ctrl->sig_mode);
 
-    ets_printf(",%d,%d,\"[%d", info->len, info->first_word_invalid, (int16_t)(compensate_gain * info->buf[0]));
-    for (int i = 1; i < info->len; i++) {
-        ets_printf(",%d", (int16_t)(compensate_gain * info->buf[i]));
+    // Emit per-subcarrier amplitude rather than raw I/Q. This use case doesn't need
+    // phase, and one value per subcarrier instead of two cuts the line roughly in half
+    // -- the bottleneck here is UART bandwidth (a raw-I/Q line is ~1215 bytes against a
+    // ~90KB/s link), so halving it directly buys back achievable ping rate and cuts the
+    // truncated/corrupted lines that come with running the link near saturation.
+    // Line type is CSI_AMP, not CSI_DATA, so a parser expecting I/Q can't misread it.
+    int n_sub = info->len / 2;
+    ets_printf(",%d,%d,\"[", n_sub, info->first_word_invalid);
+    for (int i = 0; i < n_sub; i++) {
+        float imag = compensate_gain * (int8_t)info->buf[i * 2];
+        float real = compensate_gain * (int8_t)info->buf[i * 2 + 1];
+        int amp = (int)(sqrtf(imag * imag + real * real) + 0.5f);
+        ets_printf(i ? ",%d" : "%d", amp);
     }
     ets_printf("]\"\n");
+    xSemaphoreGive(print_mux);
     s_count++;
 }
 
@@ -280,6 +344,10 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Before wifi_csi_init() or the command task, so nothing can print unguarded.
+    print_mux = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(print_mux ? ESP_OK : ESP_ERR_NO_MEM);
 
     init_led();
     set_led(40, 0, 0); // default to red/RX until the PC says otherwise
