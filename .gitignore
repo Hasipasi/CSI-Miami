@@ -15,3 +15,6 @@ __pycache__/
 *.pyc
 **/.DS_Store
 **/.vscode
+
+# Captured link-matrix snapshots (measurement output, not source)
+esp-csi/examples/get-started/tools/*.json
