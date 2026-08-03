@@ -91,7 +91,12 @@ class BoardState:
         # land inside the board's own TX span. Since CSI lines and role-change lines
         # arrive interleaved on one FIFO serial stream read by one thread, host arrival
         # order is exact for deciding which side of a role change a record falls on.
-        self.records = []          # (elapsed_s, amplitude ndarray)
+        # (elapsed_s, transmitter_mac, amplitude). The transmitter matters: binning purely
+        # by time averages packets from whichever board happened to hold the token in that
+        # window, so a bin spanning a handoff blends two physically different links into
+        # one column. Keyed by TX mac, each link is binned separately and stays a real
+        # single-link measurement regardless of round duration.
+        self.records = []
         self.tx_intervals = []     # [start_s, end_s_or_None]
         self.rssis = []            # per-record RSSI, for comparing reception quality across boards
         self.implicit_closes = 0   # TX intervals closed by inference because a ROLE_RX marker was lost
@@ -139,6 +144,7 @@ class ReaderThread(QThread):
                     continue
                 amp = np.array(csi_raw, dtype=np.float64)  # firmware already sent amplitudes
                 rssi = int(csi_data[3])
+                tx_mac = csi_data[2].lower()
             except (ValueError, json.JSONDecodeError, IndexError, StopIteration):
                 continue
 
@@ -150,13 +156,13 @@ class ReaderThread(QThread):
                 if self.board.tx_intervals and self.board.tx_intervals[-1][1] is None:
                     self.board.tx_intervals[-1][1] = now
                     self.board.implicit_closes += 1
-                self.board.records.append((now, amp))
+                self.board.records.append((now, tx_mac, amp))
                 self.board.rssis.append(rssi)
 
 
 class RoundRobinViewer(QWidget):
     def __init__(self, boards: dict, duration_s: float, round_s: float, warmup_s: float = 0.0,
-                 show_tx_bands: bool = True):
+                 show_tx_bands: bool = True, bin_hz: float = 10.0):
         super().__init__()
         self.boards = boards
         self.duration_s = duration_s
@@ -176,13 +182,22 @@ class RoundRobinViewer(QWidget):
         self.resize(panel_width, panel_height * n)
         self.setWindowTitle(f'Round-Robin CSI Amplitude ({duration_s:.0f}s)')
 
+        # Uniform time grid for the waterfalls, one column per integration bin. Each bin
+        # averages every packet that landed in it (~4 packets per 100ms bin at 50Hz with
+        # an 80% RX duty cycle), which fills in the single-packet dropouts that made the
+        # image look speckled. Bins with no packets at all stay empty -- notably a board's
+        # own TX turns, which should read as genuinely blank rather than averaged-over.
+        self.col_dt = 1.0 / bin_hz
+        self.n_cols = max(int(round(duration_s * bin_hz)), 1)
+
         self.panels = {}
         waterfall_cmap = pg.colormap.get('viridis')
+        self.lut = waterfall_cmap.getLookupTable(0.0, 1.0, 256)[:, :3]
         for idx, (port, board) in enumerate(boards.items()):
             widget = PlotWidget(self)
             widget.setGeometry(QtCore.QRect(0, idx * panel_height, panel_width, panel_height))
-            widget.setTitle(f'CSI Amplitude - {board.label}')
-            widget.setLabel('left', 'Subcarrier Index')
+            widget.setTitle(f'CSI Amplitude - {board.label}  (rows: one block per transmitter)')
+            widget.setLabel('left', 'Transmitter')
             widget.setLabel('bottom', 'Time (s)')
             widget.setXRange(0, duration_s, padding=0)
 
@@ -192,10 +207,16 @@ class RoundRobinViewer(QWidget):
             colorbar = pg.ColorBarItem(colorMap=waterfall_cmap, label='Amplitude', values=(0, 180))
             colorbar.setImageItem(img, insert_in=widget.getPlotItem())
 
-            self.panels[port] = {'widget': widget, 'img': img, 'tx_regions': []}
+            # Every board except this one -- a receiver never captures its own transmissions.
+            peers = [(b.mac, b.label) for p, b in boards.items() if p != port]
+            self.panels[port] = {'widget': widget, 'img': img, 'tx_regions': [],
+                                 'peers': peers, 'separators': []}
 
         self.readers = []
         for port, board in boards.items():
+            # Drop anything buffered from discovery or a previous run, or a stale ROLE_TX
+            # gets attributed to this run and shows up as an extra TX interval.
+            board.ser.reset_input_buffer()
             reader = ReaderThread(board, self.t0, self.stop_event)
             reader.start()
             self.readers.append(reader)
@@ -249,19 +270,65 @@ class RoundRobinViewer(QWidget):
         for port, board in self.boards.items():
             with board.lock:
                 records = list(board.records)
+            panel = self.panels[port]
             if len(records) >= 2:
-                lengths = {len(amp) for _, amp in records}
-                target_len = max(lengths, key=lambda l: sum(1 for _, a in records if len(a) == l))
-                filtered = [(t, amp) for t, amp in records if len(amp) == target_len]
-                if len(filtered) >= 2:
-                    times = np.array([t for t, _ in filtered])
-                    data = np.array([amp for _, amp in filtered]).T  # [subcarrier, time]
-                    img = self.panels[port]['img']
-                    img.setImage(data, autoLevels=False)
-                    img.setRect(QtCore.QRectF(times[0], 0, max(times[-1] - times[0], 0.01), target_len))
-                    self.panels[port]['widget'].setLabel('left', f'Subcarrier Index (0-{target_len - 1})')
+                lengths = {}
+                for _, _, amp in records:
+                    lengths[len(amp)] = lengths.get(len(amp), 0) + 1
+                target_len = max(lengths, key=lengths.get)
+
+                # Group by transmitter first, so each link is binned on its own and a bin
+                # spanning a handoff can't average two different links together.
+                by_tx = {}
+                for t, mac, amp in records:
+                    if len(amp) == target_len:
+                        by_tx.setdefault(mac, []).append((t, amp))
+
+                peers = panel['peers']
+                composite = np.full((len(peers) * target_len, self.n_cols), np.nan)
+                for pi, (mac, _label) in enumerate(peers):
+                    link = by_tx.get(mac)
+                    if not link:
+                        continue
+                    acc = np.zeros((target_len, self.n_cols))
+                    cnt = np.zeros(self.n_cols)
+                    for t, amp in link:
+                        c = int(t / self.col_dt)
+                        if 0 <= c < self.n_cols:
+                            acc[:, c] += amp
+                            cnt[c] += 1
+                    # mean over each bin; bins that caught nothing stay NaN -> transparent
+                    block = np.where(cnt[None, :] > 0, acc / np.maximum(cnt, 1)[None, :], np.nan)
+                    composite[pi * target_len:(pi + 1) * target_len, :] = block
+
+                img = panel['img']
+                img.setImage(self._to_rgba(composite), autoLevels=False)
+                img.setRect(QtCore.QRectF(0, 0, self.duration_s, len(peers) * target_len))
+                panel['widget'].getAxis('left').setTicks(
+                    [[(pi * target_len + target_len / 2.0, label) for pi, (_m, label) in enumerate(peers)]])
+                self._update_separators(panel, len(peers), target_len)
 
             self._update_tx_regions(port, board)
+
+    def _update_separators(self, panel, n_peers, block_h):
+        """Horizontal rules between per-transmitter blocks, so the stacked strips read as
+        separate links rather than one continuous subcarrier axis."""
+        while len(panel['separators']) < n_peers - 1:
+            line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen((160, 160, 160), width=1))
+            panel['widget'].addItem(line)
+            panel['separators'].append(line)
+        for i, line in enumerate(panel['separators']):
+            line.setPos((i + 1) * block_h)
+
+    def _to_rgba(self, grid):
+        """Map amplitudes through the colormap on the fixed 0-180 scale, with NaN cells
+        (no packet captured in that time slot) rendered fully transparent so real gaps
+        stay visibly empty rather than being filled by neighbouring samples."""
+        norm = np.clip(grid / 180.0, 0.0, 1.0)
+        idx = np.where(np.isnan(norm), 0, (np.nan_to_num(norm) * 255)).astype(np.uint8)
+        rgb = self.lut[idx]                       # (rows, cols, 3)
+        alpha = np.where(np.isnan(grid), 0, 255).astype(np.uint8)[:, :, None]
+        return np.concatenate([rgb, alpha], axis=2)
 
     def _update_tx_regions(self, port, board):
         if not self.show_tx_bands:
@@ -300,11 +367,18 @@ class RoundRobinViewer(QWidget):
                 observed = len(board.tx_intervals)
                 implicit = board.implicit_closes
             expected = self.commanded_tx_counts.get(port, 0)
-            missing = max(expected - observed, 0)
-            pct = (missing / expected * 100) if expected else 0.0
-            flag = '  <-- ROLE_TX markers lost' if missing else ''
+            # Report the mismatch signed, in both directions. Clamping at zero hid extra
+            # intervals (stale buffered markers) behind a reassuring "0 missing".
+            delta = observed - expected
+            pct = (abs(delta) / expected * 100) if expected else 0.0
+            if delta < 0:
+                note = f'({-delta} ROLE_TX lost, {pct:.0f}%)  <-- markers lost'
+            elif delta > 0:
+                note = f'({delta} extra, {pct:.0f}%)  <-- unexpected extra markers'
+            else:
+                note = '(exact match)'
             print(f'  [{board.label}] TX turns commanded {expected}, intervals seen {observed} '
-                  f'({missing} missing, {pct:.0f}%); {implicit} closed by inference{flag}')
+                  f'{note}; {implicit} closed by inference')
 
         print('\nReception quality per board:')
         for port, board in self.boards.items():
@@ -318,6 +392,32 @@ class RoundRobinViewer(QWidget):
             else:
                 print(f'  [{board.label}] no records')
 
+        # Per-link, because the aggregate hides which specific pairs are weak, and because
+        # the refresh rate that matters for interpreting the waterfall is per-link, not
+        # per-board: with N boards only one transmits at a time, so each link is refreshed
+        # once per full cycle (N * round_duration), not once per round.
+        cycle_s = self.round_s * len(self.ports)
+        print(f'\nPer-link capture (cycle {cycle_s * 1000:.0f}ms -> {1 / cycle_s:.1f} Hz per link, '
+              f'binning at {1 / self.col_dt:.0f} Hz):')
+        for port, board in self.boards.items():
+            with board.lock:
+                records = list(board.records)
+            counts = {}
+            for _t, mac, _amp in records:
+                counts[mac] = counts.get(mac, 0) + 1
+            parts = []
+            for mac, label in self.panels[port]['peers']:
+                n = counts.get(mac, 0)
+                parts.append(f'{label} {n / self.duration_s:5.1f}/s')
+            print(f'  [{board.label}] <- ' + '  '.join(parts))
+        if 1 / self.col_dt > 1 / cycle_s:
+            duty = self.round_s / cycle_s
+            print(f'  NOTE: binning ({1 / self.col_dt:.0f} Hz) is faster than the per-link refresh '
+                  f'({1 / cycle_s:.1f} Hz). Each link only receives during its transmitter\'s turn, '
+                  f'so ~{duty * 100:.0f}% of bins hold that burst and the rest are empty -- the strips '
+                  f'will look striped. For continuous strips use --bin-hz {1 / cycle_s:.2g} or lower '
+                  f'(one bin per full cycle), or shorten --round-duration to cycle faster.')
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -326,6 +426,10 @@ def main():
     parser.add_argument('--no-tx-bands', dest='show_tx_bands', action='store_false',
                          help='Hide the blue TX-span overlays (they are still tracked, and the '
                               'self-capture leak check still runs) -- useful for viewing the raw amplitude data')
+    parser.add_argument('-b', '--bin-hz', type=float, default=10.0,
+                         help='Waterfall integration rate in Hz (default: 10 = 100ms bins). Each bin '
+                              'averages the packets that landed in it; lower = smoother but coarser '
+                              'in time, higher = more detail but more single-packet dropouts')
     parser.add_argument('-w', '--warmup', type=float, default=0.0,
                          help='If set, the first round runs this long (seconds) before switching to '
                               '--round-duration for the rest -- lets things settle before a fast handoff rate')
@@ -340,7 +444,8 @@ def main():
     print(f'\n{len(boards)} boards. Round duration {args.round_duration}s, total run {args.duration}s.\n')
 
     app = QApplication(sys.argv)
-    window = RoundRobinViewer(boards, args.duration, args.round_duration, args.warmup, args.show_tx_bands)
+    window = RoundRobinViewer(boards, args.duration, args.round_duration, args.warmup,
+                              args.show_tx_bands, args.bin_hz)
     window.show()
     sys.exit(app.exec())
 
