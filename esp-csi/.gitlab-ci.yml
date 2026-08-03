@@ -1,0 +1,148 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  BATCH_BUILD: "1"
+  V: "0"
+  MAKEFLAGS: "-j8 --no-keep-going"
+  IDF_CI_BUILD: "1"
+
+before_script:
+  # add gitlab ssh key
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - echo -n $GITLAB_KEY > ~/.ssh/id_rsa_base64
+  - base64 --decode --ignore-garbage ~/.ssh/id_rsa_base64 > ~/.ssh/id_rsa
+  - chmod 600 ~/.ssh/id_rsa
+  - echo -e "Host gitlab.espressif.cn\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config
+
+.build_all_examples_script: &build_all_examples_script
+  - |
+    echo "Building examples: $EXAMPLES (IDF $IDF_VERSION, supported targets: ${SUPPORTED_TARGETS:-all})"
+
+    get_targets() {
+      local example=$1
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" == "${example}:"* ]]; then
+          echo "${line#${example}: }"
+          return
+        fi
+      done <<< "$EXAMPLE_TARGETS"
+      echo "esp32"
+    }
+
+    filter_targets() {
+      local targets=$1
+      if [[ -z "$SUPPORTED_TARGETS" ]]; then
+        echo "$targets"
+        return
+      fi
+      for t in $targets; do
+        for s in $SUPPORTED_TARGETS; do
+          if [[ "$t" == "$s" ]]; then
+            echo "$t"
+            break
+          fi
+        done
+      done
+    }
+
+    for EXAMPLE in $EXAMPLES; do
+      ALL_TARGETS=$(get_targets "$EXAMPLE")
+      TARGETS=$(filter_targets "$ALL_TARGETS")
+      cd "$CI_PROJECT_DIR/examples/$EXAMPLE"
+      for TARGET in $TARGETS; do
+        echo "Building $EXAMPLE for target $TARGET (IDF $IDF_VERSION)"
+        idf.py fullclean
+        idf.py --preview set-target "$TARGET"
+        idf.py build
+        echo "Build Complete for $EXAMPLE ($TARGET)"
+      done
+    done
+
+.build_template:
+  stage: build
+  tags:
+    - build
+  variables:
+    EXAMPLES: >
+      get-started/csi_send
+      get-started/csi_recv
+      get-started/csi_recv_router
+      esp-radar/console_test
+      esp-radar/connect_rainmaker
+      esp-radar/wifi_sensing_demo
+      esp-crab/master_recv
+      esp-crab/slave_recv
+      esp-crab/slave_send
+    EXAMPLE_TARGETS: |
+      get-started/csi_send: esp32 esp32s3 esp32s2 esp32c3 esp32c6 esp32c5 esp32c61
+      get-started/csi_recv: esp32 esp32s3 esp32s2 esp32c3 esp32c6 esp32c5 esp32c61
+      get-started/csi_recv_router: esp32 esp32s3 esp32s2 esp32c3 esp32c6 esp32c5 esp32c61
+      esp-radar/console_test: esp32 esp32s3 esp32s2 esp32c3 esp32c6 esp32c5 esp32c61
+      esp-radar/connect_rainmaker: esp32s3 esp32s2 esp32c3 esp32c6 esp32c5 esp32c61
+      esp-radar/wifi_sensing_demo: esp32 esp32s3 esp32s2 esp32c3 esp32c6 esp32c5 esp32c61
+      esp-crab/master_recv: esp32c5
+      esp-crab/slave_recv: esp32c5
+      esp-crab/slave_send: esp32c5
+  script:
+    - *build_all_examples_script
+
+build_idf_v5.4:
+  extends: .build_template
+  image: espressif/idf:release-v5.4
+  variables:
+    IDF_VERSION: "5.4"
+    SUPPORTED_TARGETS: "esp32 esp32s3 esp32s2 esp32c3 esp32c6"
+    RUNNER_SCRIPT_TIMEOUT: "60m"
+  timeout: 2h
+
+build_idf_v5.5:
+  extends: .build_template
+  image: espressif/idf:release-v5.5
+  variables:
+    IDF_VERSION: "5.5"
+    SUPPORTED_TARGETS: "esp32 esp32s3 esp32s2 esp32c3 esp32c6 esp32c5 esp32c61"
+    RUNNER_SCRIPT_TIMEOUT: "60m"
+  timeout: 2h
+
+push_master_to_github:
+  stage: deploy
+  tags:
+    - deploy
+  only:
+    - master
+    - /^release\/v/
+#  when: on_success
+  image: $CI_DOCKER_REGISTRY/esp32-ci-env
+  variables:
+    GIT_STRATEGY: clone
+    GITHUB_PUSH_REFS: refs/remotes/origin/release refs/remotes/origin/master
+    CI_BUILD_REF: $CI_COMMIT_REF  # Add this line to pass CI_BUILD_REF
+  before_script:
+    - echo "skip default before_script"
+  script:
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo -n $GH_PUSH_KEY >> ~/.ssh/id_rsa_base64
+    - base64 --decode --ignore-garbage ~/.ssh/id_rsa_base64 > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - echo -e "Host github.com\n\tStrictHostKeyChecking no\n" >> ~/.ssh/config
+    - git remote add github git@github.com:espressif/esp-csi.git
+    # What the next line of script does: goes through the list of refs for all branches we push to github,
+    # generates a snippet of shell which is evaluated. The snippet checks CI_BUILD_REF against the SHA
+    # (aka objectname) at tip of each branch, and if any SHAs match then it checks out the local branch
+    # and then pushes that ref to a corresponding github branch
+    #
+    # NB: In gitlab 9.x, CI_BUILD_REF was deprecated. New name is CI_COMMIT_REF. If below command suddenly
+    # generates bash syntax errors, this is probably why.
+    - |
+      if [ -n "${CI_COMMIT_TAG}" ]; then
+        # for tags
+        git push github "${CI_COMMIT_TAG}"
+      else
+        # for branches
+        git push github "${CI_COMMIT_SHA}:refs/heads/${CI_COMMIT_REF_NAME}"
+      fi

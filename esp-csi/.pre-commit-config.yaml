@@ -1,0 +1,50 @@
+# Pre-commit hooks configuration for ESP-SPOT project
+# See https://pre-commit.com for more information
+
+repos:
+  - repo: https://github.com/espressif/check-copyright/
+    rev: v1.1.1
+    hooks:
+      - id: check-copyright
+        args: ['--config', 'tools/ci/check_copyright_config.yaml']
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        # note: whitespace exclusions use multiline regex, see https://pre-commit.com/#regular-expressions
+        # items are:
+        # 1 - some file extensions
+        # 2 - any file matching *test*/*expected* (for host tests, if possible use this naming pattern always)
+        # 3 - any file with known-warnings in the name
+        # 4 - any directory named 'testdata'
+        # 5 - protobuf auto-generated files
+        exclude: &whitespace_excludes |
+          (?x)^(
+            .+\.(md|rst|map|bin)|
+            .+test.*\/.*expected.*|
+            .+known-warnings.*|
+            .+\/testdata\/.+|
+            .*_pb2.py|
+            .*.pb-c.h|
+            .*.pb-c.c|
+            .*.yuv|
+            .*.patch|
+            .*.base64|
+          )$
+      - id: end-of-file-fixer
+        exclude: *whitespace_excludes
+      - id: mixed-line-ending
+        args: ['-f=lf']
+        exclude: *whitespace_excludes
+      - id: double-quote-string-fixer
+        exclude: *whitespace_excludes
+  - repo: https://github.com/espressif/astyle_py.git
+    rev: v1.1.0
+    hooks:
+      - id: astyle_py
+        args: ['--astyle-version=3.4.7', '--rules=tools/ci/astyle-rules.yml']
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+    - id: codespell
+      args: [-w, "--ignore-words=tools/ci/codespell-ignore-list", "--skip=*.js,*.vue,*/package-lock.json.pre-commit-config.yaml"]

@@ -1,0 +1,20 @@
+services:
+  csi:
+    build: .
+    image: csi-toolkit:latest
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - ./esp-csi:/workspace/esp-csi
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      # Full /dev, not per-device entries: lets any current or future ttyACMx node be
+      # seen inside the container without editing this file or restarting for every
+      # new/replugged board (needed for the viewer's live hot-plug support).
+      - /dev:/dev
+    device_cgroup_rules:
+      # Grant the whole USB-serial (CDC-ACM) device class, major 166, rather than
+      # every device individually — this is what actually makes new nodes usable;
+      # the /dev bind mount above only makes them visible, not accessible.
+      - 'c 166:* rmw'
+    stdin_open: true
+    tty: true
