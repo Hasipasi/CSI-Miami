@@ -18,3 +18,4 @@ __pycache__/
 
 # Captured link-matrix snapshots (measurement output, not source)
 esp-csi/examples/get-started/tools/*.json
+esp-csi/examples/get-started/tools/*.npz

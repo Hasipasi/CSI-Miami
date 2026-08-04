@@ -410,6 +410,27 @@ class RoundRobinViewer(QWidget):
                 n = counts.get(mac, 0)
                 parts.append(f'{label} {n / self.duration_s:5.1f}/s')
             print(f'  [{board.label}] <- ' + '  '.join(parts))
+        # Time-resolved, because a single average over the whole run hides exactly the
+        # thing a moving-board experiment is trying to show.
+        win = 10.0
+        n_win = max(int(np.ceil(self.duration_s / win)), 1)
+        if n_win > 1:
+            print(f'\nPer-link rate in {win:.0f}s windows (rec/s):')
+            header = '  ' + ' ' * 22 + ''.join(f'{i * win:>7.0f}s' for i in range(n_win))
+            print(header)
+            for port, board in self.boards.items():
+                with board.lock:
+                    records = list(board.records)
+                for mac, label in self.panels[port]['peers']:
+                    buckets = [0] * n_win
+                    for t, m, _amp in records:
+                        if m == mac:
+                            w = int(t / win)
+                            if 0 <= w < n_win:
+                                buckets[w] += 1
+                    cells = ''.join(f'{c / win:>8.1f}' for c in buckets)
+                    print(f'  {board.label} <- {label:<10}' + cells)
+
         if 1 / self.col_dt > 1 / cycle_s:
             duty = self.round_s / cycle_s
             print(f'  NOTE: binning ({1 / self.col_dt:.0f} Hz) is faster than the per-link refresh '
