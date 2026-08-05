@@ -135,12 +135,21 @@ def main():
     axes_lks = pick_axes(lks_sorted, n=3)
     waterfalls = []
     for lk in axes_lks:
-        v = E[f'{lk}|a'].astype(float).mean(axis=0) > 1.0
-        ref = E[f'{lk}|a'].astype(float)[:, v].mean(axis=0)
+        base = E[f'{lk}|a'].astype(float)
+        v = base.mean(axis=0) > 1.0
+        # Standardise EACH subcarrier against its own empty-room distribution:
+        # subtract that subcarrier's empty mean and divide by its empty spread.
+        # Dividing by the mean alone (a plain dB ratio) removes the offset but
+        # leaves each subcarrier's dynamic range intact, so the few loud
+        # subcarriers keep dominating the image and the quiet ones stay invisible.
+        # In these units every subcarrier is on the same footing and a cell reads
+        # directly as "sigma away from what an empty room does here".
+        mu = base[:, v].mean(axis=0)
+        sd = np.maximum(base[:, v].std(axis=0), 0.5)   # floor: dead subcarriers must not blow up
         segs, bounds, seg_lab = [], [], []
         for tag, d in [('empty', E)] + [(SHORT[i], P[p]) for i, p in enumerate(POSES)]:
             a = d[f'{lk}|a'].astype(float)[:, v]
-            segs.append(20 * np.log10(np.maximum(a, 1e-9) / np.maximum(ref, 1e-9)[None, :]))
+            segs.append((a - mu[None, :]) / sd[None, :])
             bounds.append(sum(len(x) for x in segs))
             seg_lab.append(tag)
         waterfalls.append((np.vstack(segs).T, bounds, seg_lab, name(lk), angle_of(lk)))
@@ -238,14 +247,14 @@ def main():
                        color=INK_2, fontsize=9.5)
         axr.set_ylabel('subcarrier', color=INK_2, fontsize=9)
         axr.set_title(f'C{r + 1} · {lname}  —  {ang:.0f}° across the room, '
-                      f'{W.shape[1]} packets, own scale ±{limR:.0f} dB',
+                      f'{W.shape[1]} packets, own scale ±{limR:.0f}σ',
                       color=CAT[r % len(CAT)], fontsize=11.5, pad=6, loc='left',
                       fontweight='bold')
         axr.tick_params(colors=INK_2, length=0, labelsize=9)
         for sp in axr.spines.values():
             sp.set_visible(False)
         cb3 = fig.colorbar(im3, ax=axr, fraction=0.02, pad=0.012)
-        cb3.set_label('dB vs empty, per subcarrier', color=INK_2, fontsize=8.5)
+        cb3.set_label('σ from empty room (per subcarrier)', color=INK_2, fontsize=8.5)
         cb3.ax.tick_params(colors=INK_2, length=0, labelsize=8)
         cb3.outline.set_visible(False)
 
@@ -255,12 +264,14 @@ def main():
     fig.text(0.062, 0.912,
              f'{args.title} · 4 ESP32-S3 boards · {len(lks)} links · net mean {net:+.2f} dB, '
              f'individual links {np.nanmin(M):+.1f} to {np.nanmax(M):+.1f} dB, '
-             f'individual subcarriers {min(np.nanmin(W) for W, *_ in waterfalls):+.1f} to '
-             f'{max(np.nanmax(W) for W, *_ in waterfalls):+.1f} dB on the axes shown below',
+             f'axes below reach up to '
+             f'{max(max(abs(np.nanpercentile(W, 1)), abs(np.nanpercentile(W, 99))) for W, *_ in waterfalls):.0f}σ '
+             'from the empty room',
              fontsize=10.5, color=INK_2)
     fig.text(0.062, 0.876,
-             'Rows C1-C' + str(len(waterfalls)) + ' are every captured packet on links chosen to span the '
-             'widest range of orientations — the same six poses, seen from across the room.',
+             'Rows C1-C' + str(len(waterfalls)) + ': every captured packet, on links spanning the widest range of '
+             'orientations. Each subcarrier is standardised against its own empty-room mean and spread, so every\n'
+             'subcarrier contributes equally instead of the few loudest ones dominating the picture.',
              fontsize=10, color=MUTED)
 
     fig.savefig(args.out, dpi=155, facecolor=SURFACE)
