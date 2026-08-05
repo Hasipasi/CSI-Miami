@@ -161,12 +161,47 @@ real fixed-TX capture supplies the same 3 links at ~46 Hz, ~2.2x less
 per-window noise, so fixed-TX may match or beat round-robin on held poses.
 **Fixed-TX poses were never captured** -- that comparison is open.
 
+### Cross-session generalization -- the key negative result
+
+Session 2: same six poses, subject deliberately standing in a slightly shifted
+spot. Model (scaling, PCA basis, centroids) fitted on session 1 only, frozen,
+applied to session 2 (`analyze_crosssession.py`).
+
+| | |
+|---|---|
+| within session 2 (temporal split) | 100.0% |
+| **cross-session** | **47.5% (train stats) / 51.1% (per-session centring)** |
+| chance | 14.3% |
+
+So the within-session 88.7-100% was substantially fingerprinting the standing
+position, exactly as feared. Only `empty` (49/49) and `up` (15/15) transferred.
+
+But it is *not* a total failure, and the reason matters. Cosine similarity
+between session-1 and session-2 pose signatures (each session mean-removed):
+
+- same pose across sessions: **+0.57** mean
+- different poses: **-0.08** mean
+
+Transferable pose information clearly exists. What fails is the *margin*: four
+of seven diagonals are strong (0.63-0.75) but several off-diagonals are just as
+high (turned/turned 0.73 vs turned/crouch 0.76; split/split 0.63 vs split/tpose
+0.74), so nearest-centroid picks wrong by a hair. This also rules out two
+alternative explanations -- a systematic label/timing shift would make one
+off-diagonal dominate consistently, and position scrambling the signatures
+outright would leave the matrix unstructured. Neither is what we see.
+
+Confound: position and time both changed between sessions, so their
+contributions cannot be separated here. Position is very likely dominant.
+
 ### Next steps
 
-1. **Cross-session generalization** -- the most important open question. Repeat
-   the same six poses in a second session and train on one, test on the other.
-   WiFi sensing models notoriously key on session-specific multipath; 88.7%
-   within a single session does not establish that pose, rather than that
-   particular standing spot, is what was learned.
-2. **Fixed-TX pose capture**, to close the mode comparison above.
-3. **Restore phase** (stripped for UART bandwidth).
+1. **Train across multiple standing positions** (3-5 spots), not one. This is
+   the standard fix for the generalization problem above, and the +0.57
+   diagonal indicates there is real invariant signal to learn. Single-position
+   training demonstrably does not transfer.
+2. **A better classifier than nearest-centroid.** The information is present but
+   the margins are thin; LDA or a small network with several sessions of data
+   is the obvious next try.
+3. **Fixed-TX pose capture**, still never recorded -- the mode comparison for
+   poses remains open.
+4. **Restore phase** (stripped for UART bandwidth).
