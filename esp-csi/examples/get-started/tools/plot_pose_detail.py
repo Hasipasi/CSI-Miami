@@ -100,6 +100,8 @@ def main():
     ap.add_argument('--prefix', default='ps')
     ap.add_argument('--out', default='pose_detail.png')
     ap.add_argument('--title', default='Round-robin, session 1')
+    ap.add_argument('--axes', type=int, default=6,
+                    help='how many distinct link orientations to show (default: all unique links)')
     args = ap.parse_args()
 
     E = np.load(f'{args.prefix}_empty.npz')
@@ -132,7 +134,7 @@ def main():
     # ---- panel C data: one waterfall per major axis -----------------------
     # A single link only shows one viewing angle. Selecting links by orientation
     # and stacking them shows the same six poses seen from across the room.
-    axes_lks = pick_axes(lks_sorted, n=3)
+    axes_lks = pick_axes(lks_sorted, n=args.axes)
     waterfalls = []
     for lk in axes_lks:
         base = E[f'{lk}|a'].astype(float)
@@ -168,9 +170,15 @@ def main():
     print(f'  link-average limit +/-{lim:.1f} dB')
 
     nw = len(waterfalls)
-    fig = plt.figure(figsize=(16.5, 7.4 + 2.5 * nw), facecolor=SURFACE)
+    row_h = 2.5 if nw <= 3 else 1.85       # keep the sheet manageable with six rows
+    fig = plt.figure(figsize=(16.5, 7.4 + row_h * nw), facecolor=SURFACE)
+    # Hue only carries link identity while it stays within the categorical gate;
+    # past three simultaneously-comparable series, identity moves to the angle
+    # label and axis position instead of inventing more hues.
+    tint = CAT if nw <= len(CAT) else [INK] * nw
     gs = fig.add_gridspec(1 + nw, 2, height_ratios=[1.25] + [0.62] * nw,
-                          width_ratios=[1, 1.12], hspace=0.52, wspace=0.20,
+                          width_ratios=[1, 1.12],
+                          hspace=0.52 if nw <= 3 else 0.62, wspace=0.20,
                           left=0.062, right=0.945, top=0.815, bottom=0.075)
 
     # ================= panel A =================
@@ -202,15 +210,19 @@ def main():
         for b in list('ABCD')[i + 1:]:
             if a in COORDS and b in COORDS:
                 axg.plot(*zip(COORDS[a], COORDS[b]), color=GRID, lw=1.4, zorder=1)
-    for (W, _bounds, _lab, lname, ang), col in zip(waterfalls, CAT):
+    for (W, _bounds, _lab, lname, ang), col in zip(waterfalls, tint):
         a, b = lname.split('→')
         if a in COORDS and b in COORDS:
-            axg.plot(*zip(COORDS[a], COORDS[b]), color=col, lw=2.8, zorder=2)
+            axg.plot(*zip(COORDS[a], COORDS[b]),
+                     color=col if nw <= len(CAT) else INK_2,
+                     lw=2.8 if nw <= len(CAT) else 2.0, zorder=2)
             mx = (COORDS[a][0] + COORDS[b][0]) / 2
             my = (COORDS[a][1] + COORDS[b][1]) / 2
-            axg.text(mx, my, f'{ang:.0f}°', color=col, fontsize=11, fontweight='bold',
+            axg.text(mx, my, f'{ang:.0f}°',
+                     color=col if nw <= len(CAT) else INK_2,
+                     fontsize=11 if nw <= len(CAT) else 9.5, fontweight='bold',
                      ha='center', va='center',
-                     bbox=dict(fc=SURFACE, ec='none', pad=1.4), zorder=4)
+                     bbox=dict(fc=SURFACE, ec='none', pad=1.2), zorder=4)
     cx = np.mean([c[0] for c in COORDS.values()])
     cy = np.mean([c[1] for c in COORDS.values()])
     axg.plot(cx, cy, marker='*', ms=18, color=MUTED, zorder=3)
@@ -222,7 +234,7 @@ def main():
                  ha='center', va='bottom', zorder=5)
     axg.set_aspect('equal')
     axg.set_xlabel('metres', color=INK_2, fontsize=9.5)
-    axg.set_title('B · The array — the coloured links are the rows below',
+    axg.set_title('B · The array — every link below, labelled by orientation',
                   color=INK, fontsize=12, pad=8, loc='left', fontweight='bold')
     axg.tick_params(colors=INK_2, labelsize=8.5, length=0)
     for sp in axg.spines.values():
@@ -248,13 +260,13 @@ def main():
         axr.set_ylabel('subcarrier', color=INK_2, fontsize=9)
         axr.set_title(f'C{r + 1} · {lname}  —  {ang:.0f}° across the room, '
                       f'{W.shape[1]} packets, own scale ±{limR:.0f}σ',
-                      color=CAT[r % len(CAT)], fontsize=11.5, pad=6, loc='left',
+                      color=tint[r], fontsize=11.5, pad=6, loc='left',
                       fontweight='bold')
         axr.tick_params(colors=INK_2, length=0, labelsize=9)
         for sp in axr.spines.values():
             sp.set_visible(False)
         cb3 = fig.colorbar(im3, ax=axr, fraction=0.02, pad=0.012)
-        cb3.set_label('σ from empty room (per subcarrier)', color=INK_2, fontsize=8.5)
+        cb3.set_label('σ' if r == 0 else '', color=INK_2, fontsize=9)
         cb3.ax.tick_params(colors=INK_2, length=0, labelsize=8)
         cb3.outline.set_visible(False)
 
