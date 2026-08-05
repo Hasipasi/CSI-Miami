@@ -205,10 +205,10 @@ def main():
              transform=ax2.transAxes, fontsize=9, color=MUTED, va='top')
 
     # ================= panel C: one row per axis =================
-    limR = max(float(np.ceil(max(np.nanpercentile(np.abs(W), 99)
-                                 for W, _, _, _, _ in waterfalls) / 2) * 2), 1.0)
     for r, (W, bounds, seg_lab, lname, ang) in enumerate(waterfalls):
         axr = fig.add_subplot(gs[1 + r, :], facecolor=SURFACE)
+        # own scale per axis: a shared one flattens the quieter links to blank
+        limR = max(float(np.ceil(np.nanpercentile(np.abs(W), 99) / 2) * 2), 1.0)
         im3 = axr.imshow(W, cmap=DIVERGING, aspect='auto', interpolation='nearest',
                          vmin=-limR, vmax=limR)
         for b in bounds[:-1]:
@@ -220,7 +220,7 @@ def main():
                        color=INK_2, fontsize=9.5)
         axr.set_ylabel('subcarrier', color=INK_2, fontsize=9)
         axr.set_title(f'C{r + 1} · {lname}  —  {ang:.0f}° across the room, '
-                      f'{W.shape[1]} packets',
+                      f'{W.shape[1]} packets, own scale ±{limR:.0f} dB',
                       color=INK, fontsize=11.5, pad=6, loc='left', fontweight='bold')
         axr.tick_params(colors=INK_2, length=0, labelsize=9)
         for sp in axr.spines.values():
