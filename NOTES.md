@@ -175,6 +175,16 @@ real fixed-TX capture supplies the same 3 links at ~46 Hz, ~2.2x less
 per-window noise, so fixed-TX may match or beat round-robin on held poses.
 **Fixed-TX poses were never captured** -- that comparison is open.
 
+![Per-link dB change by pose](esp-csi/examples/get-started/tools/pose_db_rr.png)
+
+Regenerate with `plot_pose_db.py --prefix ps`. The body **redistributes** signal
+rather than absorbing it: net mean +0.34 dB while individual links swing -9.6 to
++13.5 dB. A->B (4.70 m, strong, direct path through the middle) loses on every
+pose; A<->C (2.30 m but weak, a destructive-interference link) gains 2-13 dB
+because the body acts as a scatterer filling a null. The ~11 dB spread across
+poses on that one link is where most of the classification power sits -- the
+weakest link is the most informative one.
+
 ### Cross-session generalization -- a data-scale limit, not a hardware one
 
 Session 2: same six poses, subject deliberately standing in a slightly shifted
