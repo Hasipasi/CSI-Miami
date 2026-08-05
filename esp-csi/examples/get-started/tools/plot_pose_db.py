@@ -15,7 +15,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.colors import LinearSegmentedColormap
 
 LABEL = {'ab:d4': 'C', '2d:3c': 'A', '2d:a8': 'B', '6b:5c': 'D'}
 POSES = ['neutral', 'tpose', 'up', 'split', 'crouch', 'turned']
@@ -80,8 +80,7 @@ def main():
 
     # ---- panel A: the full grid -------------------------------------------
     ax = fig.add_subplot(gs[0, 0], facecolor=SURFACE)
-    im = ax.imshow(M, cmap=DIVERGING, norm=TwoSlopeNorm(vmin=-lim, vcenter=0, vmax=lim),
-                   aspect='auto')
+    im = ax.imshow(M, cmap=DIVERGING, vmin=-lim, vmax=lim, aspect='auto')
     ax.set_xticks(range(len(POSES)), PRETTY, color=INK_2, fontsize=10)
     ax.set_yticks(range(len(names)), names, color=INK_2, fontsize=10)
     for i in range(M.shape[0]):
