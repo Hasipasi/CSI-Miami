@@ -88,6 +88,20 @@ where MDS produced a non-Euclidean distance matrix.
 CSI fingerprinting against surveyed positions remains plausible; RSSI
 trilateration does not.
 
+## Validation status
+
+**Hardware: validated.** Four boards matched to +/-1 dB TX/RX bias, all 12
+directed links 46.8-50 pkt/s, reciprocity 0.0-2.8 dB. The one defective board
+was identified and characterised by these measurements.
+
+**Round-robin method: validated.** 0% role-marker loss over 289 handoffs at 50 ms
+rounds, per-link data cleanly attributed by transmitter, 12 links at 9.5 Hz.
+Presence detectable at z~27; held poses separable at 22.3 sigma median.
+
+Validated as *sufficient*. Whether round-robin is *optimal* versus fixed-TX for
+pose work is still open -- see the link ablation and the missing fixed-TX pose
+capture below.
+
 ## Pose-estimation assessment
 
 Measured with `capture_wizard.py` (three conditions: empty room / person still /
@@ -161,7 +175,7 @@ real fixed-TX capture supplies the same 3 links at ~46 Hz, ~2.2x less
 per-window noise, so fixed-TX may match or beat round-robin on held poses.
 **Fixed-TX poses were never captured** -- that comparison is open.
 
-### Cross-session generalization -- the key negative result
+### Cross-session generalization -- a data-scale limit, not a hardware one
 
 Session 2: same six poses, subject deliberately standing in a slightly shifted
 spot. Model (scaling, PCA basis, centroids) fitted on session 1 only, frozen,
@@ -173,8 +187,10 @@ applied to session 2 (`analyze_crosssession.py`).
 | **cross-session** | **47.5% (train stats) / 51.1% (per-session centring)** |
 | chance | 14.3% |
 
-So the within-session 88.7-100% was substantially fingerprinting the standing
-position, exactly as feared. Only `empty` (49/49) and `up` (15/15) transferred.
+So a model trained at one standing spot does not transfer to another. This is a
+statement about training data, not about the instrument: 6 poses x 12 s from a
+single position is far too little to expect position invariance. Only `empty`
+(49/49) and `up` (15/15) transferred.
 
 But it is *not* a total failure, and the reason matters. Cosine similarity
 between session-1 and session-2 pose signatures (each session mean-removed):
