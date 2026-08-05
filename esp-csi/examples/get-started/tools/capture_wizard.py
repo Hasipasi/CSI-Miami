@@ -45,6 +45,28 @@ N_META = 25
 RED, YELLOW, BLUE, GREEN, WHITE, OFF = (
     (40, 0, 0), (40, 30, 0), (0, 0, 40), (0, 40, 0), (30, 30, 30), (0, 0, 0))
 
+POSES = [
+    ('neutral', 'ARMS DOWN at your sides'),
+    ('tpose',   'T-POSE: both arms straight out sideways'),
+    ('up',      'BOTH ARMS STRAIGHT UP'),
+    ('split',   'RIGHT ARM FORWARD, LEFT ARM BACK'),
+    ('crouch',  'CROUCH / SQUAT and hold'),
+    ('turned',  'TURN 90 DEGREES, arms down'),
+]
+
+
+def pose_phases(hold, settle):
+    """Held-pose protocol: the question is whether distinct static poses give
+    separable channel signatures, which a single motion sequence cannot answer."""
+    ph = [('leave', 20, 'LEAVE THE ROOM NOW', 'Close the door. Boards RED.', RED, False),
+          ('empty', 25, 'EMPTY ROOM - STAY OUT', 'Reference capture.', RED, True),
+          ('enter', 20, 'COME BACK IN', 'Stand in the middle of the array.', YELLOW, False)]
+    for key, desc in POSES:
+        ph.append((f'get_{key}', settle, f'GET INTO POSITION', desc, YELLOW, False))
+        ph.append((key, hold, desc, 'HOLD STILL - capturing', BLUE, True))
+    return ph
+
+
 # (key, seconds, headline, detail, led, save?)
 PHASES = [
     ('leave',  20, 'LEAVE THE ROOM NOW',      'Close the door behind you. Boards turn RED.',      RED,    False),
@@ -247,6 +269,8 @@ class Wizard(QWidget):
     def done(self):
         self.deadline = None
         self.collecting = False
+        if hasattr(self, 'rr'):
+            self.rr.stop()  # else it keeps writing to ports that are about to close
         self.set_leds(WHITE)
         self.set_bg('#444444')
         self.head.setText('DONE')
@@ -283,7 +307,14 @@ def main():
     ap.add_argument('--mode', choices=['fixedtx', 'roundrobin'], default='fixedtx')
     ap.add_argument('--round-duration', type=float, default=0.05)
     ap.add_argument('--prefix', default='run')
+    ap.add_argument('--protocol', choices=['motion', 'poses'], default='motion')
+    ap.add_argument('--hold', type=float, default=12.0, help='seconds to hold each pose')
+    ap.add_argument('--settle', type=float, default=8.0, help='seconds to get into each pose')
     args = ap.parse_args()
+
+    if args.protocol == 'poses':
+        global PHASES
+        PHASES = pose_phases(args.hold, args.settle)
 
     boards = discover()
     if len(boards) < 2:

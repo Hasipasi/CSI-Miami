@@ -124,18 +124,49 @@ turn, squat). A low rank may partly reflect limited motion diversity rather than
 a sensor limit -- the same confound that made the earlier line-geometry numbers
 useless.
 
+### Held-pose discrimination -- the decisive test
+
+Six held poses plus an empty room, round-robin, `analyze_poses.py`:
+
+| | |
+|---|---|
+| chance | 14.3% |
+| leave-one-out | 97.9% (optimistic: adjacent windows correlate) |
+| **temporal split** | **88.7%** (train first half of each hold, test second half) |
+| median pairwise separability | 22.3 sigma, no pair below 3 |
+
+With four boards, **amplitude only**, 12 s per pose and a nearest-centroid
+classifier on 20 PCs. The only real confusion is T-pose vs arms-up (both put the
+arms away from the torso), which is semantically coherent rather than arbitrary
+-- mild evidence the classifier keys on body configuration, not session noise.
+
+This overturns an earlier pessimistic reading here that compared "effective rank
+6-9" against 30-60 skeleton DOF. That was wrong twice over: pose lives on a
+low-dimensional manifold so raw DOF is the wrong denominator, and the rank
+itself was unmeasurable from that data (round-robin's "120 components above
+noise" was exactly its 120 time samples -- observation-limited, not
+channel-limited).
+
+### Link-count ablation (same data, same classifier)
+
+| links | accuracy |
+|---|---|
+| all 12 | 88.7% |
+| 6 (two TX) | 85.6-88.7% |
+| 3 (one TX) | 82.5-84.5% |
+
+4x the links buys ~5 points -- strongly sublinear, matching the measured link
+redundancy. Note these 3-link figures come from round-robin data at 9.5 Hz; a
+real fixed-TX capture supplies the same 3 links at ~46 Hz, ~2.2x less
+per-window noise, so fixed-TX may match or beat round-robin on held poses.
+**Fixed-TX poses were never captured** -- that comparison is open.
+
 ### Next steps
 
-- **Static pose discrimination** is the right next experiment: capture several
-  distinct held poses and measure separability. Since a motionless person is
-  detectable at z~27, this tests pose-reading capacity directly instead of
-  inferring it from one motion sequence.
-- **Restore phase** (stripped for UART bandwidth). Likely raises effective rank
-  more than any sampling change.
-- More boards would add links, but note 12 links only bought rank 9 -- returns
-  are sublinear because links and subcarriers are highly redundant.
-
-## Localization idea -- not started
-
-Grid + permutation plan still open. Note the RSSI finding above: use CSI
-fingerprinting, not RSSI multilateration.
+1. **Cross-session generalization** -- the most important open question. Repeat
+   the same six poses in a second session and train on one, test on the other.
+   WiFi sensing models notoriously key on session-specific multipath; 88.7%
+   within a single session does not establish that pose, rather than that
+   particular standing spot, is what was learned.
+2. **Fixed-TX pose capture**, to close the mode comparison above.
+3. **Restore phase** (stripped for UART bandwidth).
