@@ -29,6 +29,9 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
 LABEL = {'ab:d4': 'C', '2d:3c': 'A', '2d:a8': 'B', '6b:5c': 'D'}
+# measured by hand, reconstructed to 1.6 mm RMS -- see NOTES.md
+COORDS = {'A': (0.000, 0.000), 'B': (4.698, 0.000),
+          'C': (1.986, 1.164), 'D': (1.307, -2.867)}
 POSES = ['neutral', 'tpose', 'up', 'split', 'crouch', 'turned']
 PRETTY = ['arms\ndown', 'T-pose', 'arms\nup', 'split\narms', 'crouch', 'turned\n90°']
 SHORT = ['arms down', 'T-pose', 'arms up', 'split arms', 'crouch', 'turned 90°']
@@ -51,6 +54,44 @@ def links(d):
 def name(lk):
     tx, rx = lk.split('|')
     return f'{LABEL.get(tx[-5:], tx[-5:])}→{LABEL.get(rx[-5:], rx[-5:])}'
+
+
+def angle_of(lk):
+    """Link orientation in degrees, folded to 0-180 (a link has no direction)."""
+    tx, rx = lk.split('|')
+    a, b = LABEL.get(tx[-5:]), LABEL.get(rx[-5:])
+    if a not in COORDS or b not in COORDS:
+        return float('nan')
+    (x1, y1), (x2, y2) = COORDS[a], COORDS[b]
+    return float(np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180)
+
+
+def pick_axes(lk_list, n=3):
+    """Links spanning the widest range of orientations. One waterfall per axis
+    shows what a single link cannot: the same pose seen from different angles.
+    Reciprocal pairs (A->B and B->A) share an orientation, so keep only one."""
+    seen, uniq = set(), []
+    for lk in lk_list:
+        key = frozenset(name(lk).split('→'))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(lk)
+    uniq = [lk for lk in uniq if np.isfinite(angle_of(lk))]
+    uniq.sort(key=angle_of)
+    if len(uniq) <= n:
+        return uniq
+    # greedy: widest angular spread
+    chosen = [uniq[0], uniq[-1]]
+    while len(chosen) < n:
+        best, bestgap = None, -1
+        for lk in uniq:
+            if lk in chosen:
+                continue
+            gap = min(abs(angle_of(lk) - angle_of(c)) for c in chosen)
+            if gap > bestgap:
+                best, bestgap = lk, gap
+        chosen.append(best)
+    return sorted(chosen, key=angle_of)
 
 
 def main():
@@ -87,20 +128,21 @@ def main():
     valid = base_sc > 1.0          # guard-band subcarriers are ~0 and would divide to noise
     S = S[:, valid]
 
-    # ---- panel C data: per-packet, normalised per subcarrier --------------
-    # Each subcarrier is divided by its OWN empty-room level before plotting.
-    # Raw amplitude is dominated by static frequency-selective fading -- strong
-    # horizontal banding that is a property of the room, not of the person --
-    # and that banding swamps the change we actually want to see. Normalising
-    # per subcarrier removes it and puts every subcarrier on the same dB scale.
-    ref_sc = E[f'{key_lk}|a'].astype(float)[:, valid].mean(axis=0)
-    segs, bounds, seg_lab = [], [], []
-    for tag, d in [('empty', E)] + [(SHORT[i], P[p]) for i, p in enumerate(POSES)]:
-        a = d[f'{key_lk}|a'].astype(float)[:, valid]
-        segs.append(20 * np.log10(np.maximum(a, 1e-9) / np.maximum(ref_sc, 1e-9)[None, :]))
-        bounds.append(sum(len(s) for s in segs))
-        seg_lab.append(tag)
-    RAW = np.vstack(segs).T          # [subcarrier x packet], dB vs own empty level
+    # ---- panel C data: one waterfall per major axis -----------------------
+    # A single link only shows one viewing angle. Selecting links by orientation
+    # and stacking them shows the same six poses seen from across the room.
+    axes_lks = pick_axes(lks_sorted, n=3)
+    waterfalls = []
+    for lk in axes_lks:
+        v = E[f'{lk}|a'].astype(float).mean(axis=0) > 1.0
+        ref = E[f'{lk}|a'].astype(float)[:, v].mean(axis=0)
+        segs, bounds, seg_lab = [], [], []
+        for tag, d in [('empty', E)] + [(SHORT[i], P[p]) for i, p in enumerate(POSES)]:
+            a = d[f'{lk}|a'].astype(float)[:, v]
+            segs.append(20 * np.log10(np.maximum(a, 1e-9) / np.maximum(ref, 1e-9)[None, :]))
+            bounds.append(sum(len(x) for x in segs))
+            seg_lab.append(tag)
+        waterfalls.append((np.vstack(segs).T, bounds, seg_lab, name(lk), angle_of(lk)))
 
     def sym_limit(arr, floor=1.0):
         """Symmetric colour limit about zero. Guarded: an all-NaN or all-zero
@@ -116,10 +158,11 @@ def main():
     print(f'  panel A limit +/-{lim:.1f} dB, panel B limit +/-{limS:.1f} dB, '
           f'S finite {np.isfinite(S).sum()}/{S.size}')
 
-    fig = plt.figure(figsize=(16.5, 9.6), facecolor=SURFACE)
-    gs = fig.add_gridspec(2, 2, height_ratios=[1, 0.82], width_ratios=[1, 1.12],
-                          hspace=0.60, wspace=0.20,
-                          left=0.062, right=0.945, top=0.815, bottom=0.085)
+    nw = len(waterfalls)
+    fig = plt.figure(figsize=(16.5, 7.4 + 2.5 * nw), facecolor=SURFACE)
+    gs = fig.add_gridspec(1 + nw, 2, height_ratios=[1.25] + [0.62] * nw,
+                          width_ratios=[1, 1.12], hspace=0.52, wspace=0.20,
+                          left=0.062, right=0.945, top=0.815, bottom=0.075)
 
     # ================= panel A =================
     ax = fig.add_subplot(gs[0, 0], facecolor=SURFACE)
@@ -156,52 +199,54 @@ def main():
     cb2.set_label('change vs empty (dB)', color=INK_2, fontsize=9)
     cb2.ax.tick_params(colors=INK_2, length=0, labelsize=8)
     cb2.outline.set_visible(False)
-    ax2.text(0.0, -0.235, 'the per-link average in panel A hides this: the response is '
+    ax2.text(0.0, -0.145, 'the per-link average in panel A hides this: the response is '
                           'strongly frequency-selective, and\ndifferent poses light up different '
                           f'subcarrier bands — note this scale runs to ±{limS:.0f} dB, not ±{lim:.0f}',
              transform=ax2.transAxes, fontsize=9, color=MUTED, va='top')
 
-    # ================= panel C =================
-    ax3 = fig.add_subplot(gs[1, :], facecolor=SURFACE)
-    limR = max(float(np.ceil(np.nanpercentile(np.abs(RAW), 99) / 2) * 2), 1.0)
-    im3 = ax3.imshow(RAW, cmap=DIVERGING, aspect='auto', interpolation='nearest',
-                     vmin=-limR, vmax=limR)
-    for b in bounds[:-1]:
-        ax3.axvline(b, color=SURFACE, lw=2.5)
-        ax3.axvline(b, color=INK_2, lw=1.0, ls=(0, (3, 2)))
-    mid = [(0 if i == 0 else bounds[i - 1] + bounds[i]) / 2 if i else bounds[0] / 2
-           for i in range(len(bounds))]
-    mid = [(([0] + bounds)[i] + bounds[i]) / 2 for i in range(len(bounds))]
-    ax3.set_xticks(mid, seg_lab, color=INK_2, fontsize=9.5)
-    ax3.set_ylabel('subcarrier index', color=INK_2, fontsize=9.5)
-    ax3.set_title(f'C · Every captured packet — {key_name}, each subcarrier '
-                  'normalised against its own empty-room level',
-                  color=INK, fontsize=12, pad=8, loc='left', fontweight='bold')
-    ax3.tick_params(colors=INK_2, length=0, labelsize=9)
-    for s in ax3.spines.values():
-        s.set_visible(False)
-    cb3 = fig.colorbar(im3, ax=ax3, fraction=0.018, pad=0.012)
-    cb3.set_label('change vs empty, per subcarrier (dB)', color=INK_2, fontsize=9)
-    cb3.ax.tick_params(colors=INK_2, length=0, labelsize=8)
-    cb3.outline.set_visible(False)
-    ax3.text(0.0, -0.155, f'{RAW.shape[1]} packets × {RAW.shape[0]} subcarriers. Each block is one '
-                          'held pose; the empty block at left is flat by construction (it is the reference). '
-                          'Without this normalisation the panel is dominated by static fading — a property of '
-                          'the room, not the person.',
-             transform=ax3.transAxes, fontsize=9, color=MUTED, va='top')
+    # ================= panel C: one row per axis =================
+    limR = max(float(np.ceil(max(np.nanpercentile(np.abs(W), 99)
+                                 for W, _, _, _, _ in waterfalls) / 2) * 2), 1.0)
+    for r, (W, bounds, seg_lab, lname, ang) in enumerate(waterfalls):
+        axr = fig.add_subplot(gs[1 + r, :], facecolor=SURFACE)
+        im3 = axr.imshow(W, cmap=DIVERGING, aspect='auto', interpolation='nearest',
+                         vmin=-limR, vmax=limR)
+        for b in bounds[:-1]:
+            axr.axvline(b, color=SURFACE, lw=2.5)
+            axr.axvline(b, color=INK_2, lw=1.0, ls=(0, (3, 2)))
+        mid = [(([0] + bounds)[i] + bounds[i]) / 2 for i in range(len(bounds))]
+        last = (r == len(waterfalls) - 1)
+        axr.set_xticks(mid, seg_lab if last else [''] * len(seg_lab),
+                       color=INK_2, fontsize=9.5)
+        axr.set_ylabel('subcarrier', color=INK_2, fontsize=9)
+        axr.set_title(f'C{r + 1} · {lname}  —  {ang:.0f}° across the room, '
+                      f'{W.shape[1]} packets',
+                      color=INK, fontsize=11.5, pad=6, loc='left', fontweight='bold')
+        axr.tick_params(colors=INK_2, length=0, labelsize=9)
+        for sp in axr.spines.values():
+            sp.set_visible(False)
+        cb3 = fig.colorbar(im3, ax=axr, fraction=0.02, pad=0.012)
+        cb3.set_label('dB vs empty, per subcarrier', color=INK_2, fontsize=8.5)
+        cb3.ax.tick_params(colors=INK_2, length=0, labelsize=8)
+        cb3.outline.set_visible(False)
 
     net = np.nanmean(M)
-    fig.text(0.062, 0.945, 'A person changes each Wi-Fi link differently — and each subcarrier differently again',
+    fig.text(0.062, 0.955, 'A person changes each Wi-Fi link differently — and each subcarrier differently again',
              fontsize=17.5, color=INK, fontweight='bold')
-    fig.text(0.062, 0.895,
+    fig.text(0.062, 0.912,
              f'{args.title} · 4 ESP32-S3 boards · {len(lks)} links · net mean {net:+.2f} dB, '
              f'individual links {np.nanmin(M):+.1f} to {np.nanmax(M):+.1f} dB, '
              f'individual subcarriers {np.nanmin(S):+.1f} to {np.nanmax(S):+.1f} dB',
              fontsize=10.5, color=INK_2)
+    fig.text(0.062, 0.876,
+             'Rows C1-C' + str(len(waterfalls)) + ' are every captured packet on links chosen to span the '
+             'widest range of orientations — the same six poses, seen from across the room.',
+             fontsize=10, color=MUTED)
 
     fig.savefig(args.out, dpi=155, facecolor=SURFACE)
-    print(f'wrote {args.out}  (key link {key_name}, {RAW.shape[1]} packets, '
-          f'{RAW.shape[0]} usable subcarriers)')
+    print(f'wrote {args.out}  (panel B link {key_name}; '
+          f'{len(waterfalls)} axes: ' +
+          ', '.join(f'{n} @{a:.0f}°' for _W, _b, _l, n, a in waterfalls) + ')')
     print(f'  link range {np.nanmin(M):+.2f}..{np.nanmax(M):+.2f} dB, '
           f'subcarrier range {np.nanmin(S):+.2f}..{np.nanmax(S):+.2f} dB')
 
