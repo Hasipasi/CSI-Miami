@@ -43,6 +43,7 @@ MUTED = '#898781'
 GRID = '#e1e0d9'
 DIVERGING = LinearSegmentedColormap.from_list('loss_gain', [
     '#d03b3b', '#e34948', '#e66767', '#f0efec', '#86b6ef', '#3987e5', '#1c5cab'])
+CAT = ['#2a78d6', '#eb6834', '#1baf7a']   # palette slots 1-3, ties an axis to its waterfall
 SEQ = LinearSegmentedColormap.from_list('amp', [
     '#f0efec', '#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#104281', '#0d366b'])
 
@@ -155,8 +156,7 @@ def main():
 
     lim = sym_limit(M)
     limS = sym_limit(S)
-    print(f'  panel A limit +/-{lim:.1f} dB, panel B limit +/-{limS:.1f} dB, '
-          f'S finite {np.isfinite(S).sum()}/{S.size}')
+    print(f'  link-average limit +/-{lim:.1f} dB')
 
     nw = len(waterfalls)
     fig = plt.figure(figsize=(16.5, 7.4 + 2.5 * nw), facecolor=SURFACE)
@@ -184,25 +184,43 @@ def main():
     cb.ax.tick_params(colors=INK_2, length=0, labelsize=8)
     cb.outline.set_visible(False)
 
-    # ================= panel B =================
-    ax2 = fig.add_subplot(gs[0, 1], facecolor=SURFACE)
-    im2 = ax2.imshow(S, cmap=DIVERGING, vmin=-limS, vmax=limS,
-                     aspect='auto', interpolation='nearest')
-    ax2.set_yticks(range(len(POSES)), SHORT, color=INK_2, fontsize=9.5)
-    ax2.set_xlabel('subcarrier index', color=INK_2, fontsize=9.5)
-    ax2.set_title(f'B · The same link ({key_name}) resolved across frequency',
+    # ================= panel B: the array =================
+    # The geometry earns this slot more than another subcarrier heatmap did: the
+    # waterfalls below are labelled by orientation, and this is what makes those
+    # angles mean something.
+    axg = fig.add_subplot(gs[0, 1], facecolor=SURFACE)
+    for i, a in enumerate('ABCD'):
+        for b in list('ABCD')[i + 1:]:
+            if a in COORDS and b in COORDS:
+                axg.plot(*zip(COORDS[a], COORDS[b]), color=GRID, lw=1.4, zorder=1)
+    for (W, _bounds, _lab, lname, ang), col in zip(waterfalls, CAT):
+        a, b = lname.split('→')
+        if a in COORDS and b in COORDS:
+            axg.plot(*zip(COORDS[a], COORDS[b]), color=col, lw=2.8, zorder=2)
+            mx = (COORDS[a][0] + COORDS[b][0]) / 2
+            my = (COORDS[a][1] + COORDS[b][1]) / 2
+            axg.text(mx, my, f'{ang:.0f}°', color=col, fontsize=11, fontweight='bold',
+                     ha='center', va='center',
+                     bbox=dict(fc=SURFACE, ec='none', pad=1.4), zorder=4)
+    cx = np.mean([c[0] for c in COORDS.values()])
+    cy = np.mean([c[1] for c in COORDS.values()])
+    axg.plot(cx, cy, marker='*', ms=18, color=MUTED, zorder=3)
+    axg.text(cx + 0.28, cy - 0.10, 'subject', color=MUTED, fontsize=9.5,
+             ha='left', va='top')
+    for k, (x, y) in COORDS.items():
+        axg.plot(x, y, 'o', ms=13, color=INK, zorder=5)
+        axg.text(x, y + 0.30, k, color=INK, fontsize=12.5, fontweight='bold',
+                 ha='center', va='bottom', zorder=5)
+    axg.set_aspect('equal')
+    axg.set_xlabel('metres', color=INK_2, fontsize=9.5)
+    axg.set_title('B · The array — the coloured links are the rows below',
                   color=INK, fontsize=12, pad=8, loc='left', fontweight='bold')
-    ax2.tick_params(colors=INK_2, length=0, labelsize=8.5)
-    for s in ax2.spines.values():
-        s.set_visible(False)
-    cb2 = fig.colorbar(im2, ax=ax2, fraction=0.04, pad=0.02)
-    cb2.set_label('change vs empty (dB)', color=INK_2, fontsize=9)
-    cb2.ax.tick_params(colors=INK_2, length=0, labelsize=8)
-    cb2.outline.set_visible(False)
-    ax2.text(0.0, -0.145, 'the per-link average in panel A hides this: the response is '
-                          'strongly frequency-selective, and\ndifferent poses light up different '
-                          f'subcarrier bands — note this scale runs to ±{limS:.0f} dB, not ±{lim:.0f}',
-             transform=ax2.transAxes, fontsize=9, color=MUTED, va='top')
+    axg.tick_params(colors=INK_2, labelsize=8.5, length=0)
+    for sp in axg.spines.values():
+        sp.set_visible(False)
+    axg.grid(color=GRID, lw=0.8)
+    axg.set_axisbelow(True)
+    axg.margins(0.14)
 
     # ================= panel C: one row per axis =================
     for r, (W, bounds, seg_lab, lname, ang) in enumerate(waterfalls):
@@ -221,7 +239,8 @@ def main():
         axr.set_ylabel('subcarrier', color=INK_2, fontsize=9)
         axr.set_title(f'C{r + 1} · {lname}  —  {ang:.0f}° across the room, '
                       f'{W.shape[1]} packets, own scale ±{limR:.0f} dB',
-                      color=INK, fontsize=11.5, pad=6, loc='left', fontweight='bold')
+                      color=CAT[r % len(CAT)], fontsize=11.5, pad=6, loc='left',
+                      fontweight='bold')
         axr.tick_params(colors=INK_2, length=0, labelsize=9)
         for sp in axr.spines.values():
             sp.set_visible(False)
@@ -236,7 +255,8 @@ def main():
     fig.text(0.062, 0.912,
              f'{args.title} · 4 ESP32-S3 boards · {len(lks)} links · net mean {net:+.2f} dB, '
              f'individual links {np.nanmin(M):+.1f} to {np.nanmax(M):+.1f} dB, '
-             f'individual subcarriers {np.nanmin(S):+.1f} to {np.nanmax(S):+.1f} dB',
+             f'individual subcarriers {min(np.nanmin(W) for W, *_ in waterfalls):+.1f} to '
+             f'{max(np.nanmax(W) for W, *_ in waterfalls):+.1f} dB on the axes shown below',
              fontsize=10.5, color=INK_2)
     fig.text(0.062, 0.876,
              'Rows C1-C' + str(len(waterfalls)) + ' are every captured packet on links chosen to span the '
