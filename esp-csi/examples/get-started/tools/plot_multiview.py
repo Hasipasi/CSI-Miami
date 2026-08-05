@@ -97,7 +97,7 @@ def main():
 
     fig = plt.figure(figsize=(16.2, 10.2), facecolor=SURFACE)
     gs = fig.add_gridspec(2, 3, height_ratios=[1, 0.95], width_ratios=[0.82, 1, 1],
-                          hspace=0.34, wspace=0.26,
+                          hspace=0.34, wspace=0.34,
                           left=0.055, right=0.945, top=0.815, bottom=0.125)
 
     # ---------- geometry ----------
@@ -169,32 +169,31 @@ def main():
         S = np.array([20 * np.log10(np.maximum(P[p][f'{lk}|a'].astype(float).mean(axis=0), 1e-9)
                                     / np.maximum(base_sc, 1e-9)) for p in POSES])[:, valid]
         panels.append((S, lab, ang))
-    limS = max(float(np.ceil(max(np.nanmax(np.abs(S)) for S, _, _ in panels) / 2) * 2), 1.0)
-
     for k, ((S, lab, ang), col) in enumerate(zip(panels, CAT)):
         axs = fig.add_subplot(gs[1, k], facecolor=SURFACE)
-        im2 = axs.imshow(S, cmap=DIVERGING, vmin=-limS, vmax=limS,
+        # Per-panel scale, so the quieter angles show their structure instead of
+        # reading as blank. The magnitude comparison is not lost: each panel
+        # states its true range, and the colourbars make the difference explicit.
+        limK = max(float(np.ceil(np.nanmax(np.abs(S)) / 2) * 2), 1.0)
+        im2 = axs.imshow(S, cmap=DIVERGING, vmin=-limK, vmax=limK,
                          aspect='auto', interpolation='nearest')
         axs.set_yticks(range(len(POSES)), SHORT if k == 0 else [''] * len(POSES),
                        color=INK_2, fontsize=9.5)
         axs.set_xlabel('subcarrier index', color=INK_2, fontsize=9.5)
         axs.set_title(f'{lab}   {ang:.0f}° across the room', color=col,
                       fontsize=12, pad=28, loc='left', fontweight='bold')
-        axs.text(0.0, 1.018, f'spans {np.nanmin(S):+.1f} to {np.nanmax(S):+.1f} dB',
+        axs.text(0.0, 1.018, f'spans {np.nanmin(S):+.1f} to {np.nanmax(S):+.1f} dB '
+                             f'— own scale ±{limK:.0f}',
                  transform=axs.transAxes, fontsize=9, color=MUTED, va='bottom')
         axs.tick_params(colors=INK_2, length=0, labelsize=8.5)
-        for s in axs.spines.values():
-            s.set_visible(False)
-        for sp in ('bottom', 'left', 'top', 'right'):
-            axs.spines[sp].set_visible(False)
-        # a coloured rule ties the panel back to its link in the geometry
+        for sp in axs.spines.values():
+            sp.set_visible(False)
         axs.add_patch(plt.Rectangle((0, -0.6), S.shape[1], 0.16, color=col,
                                     clip_on=False, zorder=6))
-        if k == len(panels) - 1:
-            cb2 = fig.colorbar(im2, ax=axs, fraction=0.03, pad=0.015)
-            cb2.set_label('change vs empty (dB)', color=INK_2, fontsize=9)
-            cb2.ax.tick_params(colors=INK_2, length=0, labelsize=8)
-            cb2.outline.set_visible(False)
+        cbk = fig.colorbar(im2, ax=axs, fraction=0.045, pad=0.02)
+        cbk.set_label('dB vs empty', color=INK_2, fontsize=8.5)
+        cbk.ax.tick_params(colors=INK_2, length=0, labelsize=8)
+        cbk.outline.set_visible(False)
 
     fig.text(0.055, 0.945,
              'Round-robin sees the same person from several angles at once',
@@ -205,9 +204,9 @@ def main():
              'each resolves the same pose into a different subcarrier pattern',
              fontsize=10.5, color=INK_2)
     fig.text(0.055, 0.020,
-             'Bottom row: same six poses, same colour scale, three viewing angles. The shared scale is deliberate — a pose that\n'
-             'dominates one angle can barely register on another, which is the information a single transmitter cannot reach.\n'
-             'Each panel also states its own range, since the shared scale flattens the quieter links.',
+             'Bottom row: same six poses, three viewing angles, each on its OWN colour scale so the quieter angles reveal their\n'
+             'structure. Compare magnitudes from the stated ranges, not the colours: A↔C spans about 37 dB while C↔D and A↔B\n'
+             'span under 10 — a pose that dominates one angle barely registers on another, which a single transmitter cannot see.',
              fontsize=9.5, color=MUTED, linespacing=1.5)
 
     fig.savefig(args.out, dpi=155, facecolor=SURFACE)
