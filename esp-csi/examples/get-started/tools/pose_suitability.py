@@ -73,12 +73,20 @@ def parse(line):
         return None
 
 
-def capture(mode, duration, round_s):
+def capture(mode, duration, round_s, tx_mac=None):
     boards = discover()
-    macs = list(boards)
+    # Sorted, not dict-insertion order: discovery runs in threads, so insertion order
+    # varies run to run. A different transmitter between the static and moving captures
+    # would silently invalidate the comparison between them.
+    macs = sorted(boards)
     if len(macs) < 2:
         print('need >= 2 boards')
         sys.exit(1)
+    if tx_mac:
+        tx_mac = tx_mac.lower()
+        if tx_mac not in boards:
+            print(f'requested TX {tx_mac} not connected; have {macs}')
+            sys.exit(1)
 
     recs = {m: [] for m in macs}   # rx_mac -> list of (t, tx_mac, amp)
     stop = threading.Event()
@@ -105,7 +113,7 @@ def capture(mode, duration, round_s):
         t.start()
 
     if mode == 'fixedtx':
-        tx = macs[0]
+        tx = tx_mac or macs[0]
         boards[tx].write(b'TX\n')
         for m in macs:
             if m != tx:
@@ -289,6 +297,7 @@ def main():
     c.add_argument('--mode', choices=['roundrobin', 'fixedtx'], default='fixedtx')
     c.add_argument('--duration', type=float, default=20.0)
     c.add_argument('--round-duration', type=float, default=0.05)
+    c.add_argument('--tx', help='MAC of the transmitter for fixedtx mode (default: lowest MAC)')
     c.add_argument('--out', required=True)
 
     a = sub.add_parser('analyze')
@@ -296,7 +305,7 @@ def main():
 
     args = ap.parse_args()
     if args.cmd == 'capture':
-        recs = capture(args.mode, args.duration, args.round_duration)
+        recs = capture(args.mode, args.duration, args.round_duration, args.tx)
         save(recs, args.out, args.mode)
     else:
         analyze(args.files)

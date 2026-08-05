@@ -183,6 +183,18 @@ static void uart_command_task(void *arg)
             } else {
                 ESP_LOGW(TAG, "bad RX command: '%s'", line);
             }
+        } else if (strncmp(line, "LED ", 4) == 0) {
+            // Arbitrary colour, so the boards can act as an in-room status indicator
+            // during a capture -- the operator is in the room with them and usually
+            // cannot see the PC screen. Deliberately silent: this runs while CSI is
+            // streaming and a log line per colour change is just noise on the wire.
+            unsigned r, g, b;
+            if (sscanf(line + 4, "%u,%u,%u", &r, &g, &b) == 3) {
+                ident_mode = true;  // pin it: role changes must not overwrite the cue
+                set_led(r & 0xff, g & 0xff, b & 0xff);
+            } else {
+                ESP_LOGW(TAG, "bad LED command: '%s'", line);
+            }
         } else if (strcmp(line, "IDENT") == 0) {
             ident_mode = true;
             set_led(40, 20, 0); // orange -- physically identifies this board on the bench

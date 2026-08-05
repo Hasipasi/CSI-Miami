@@ -54,43 +54,88 @@ and five of six pairs agree within ~1 dB in both directions.
   `analyze` for sampling rate, motion-vs-static variation, channel coherence,
   effective dimensionality and link diversity.
 
-## Pose-estimation assessment — INCOMPLETE
+## Room geometry (home setup, 4 boards)
 
-First pass measured, but with a setup that was **not** suited to the question:
-boards in a line, stimulus was a hand waved between them.
+Measured by hand, reconstructed by `measure_geometry.py`. RMS residual 1.6 mm,
+out-of-plane component 0.0% -- a flat layout at equal height.
 
-Conclusion that survives that flaw (it is purely temporal):
+| board | MAC | x (m) | y (m) |
+|---|---|---|---|
+| A | `14:c1:9f:c1:2d:3c` | 0.00 | 0.00 |
+| B | `14:c1:9f:c1:2d:a8` | 4.70 | 0.00 |
+| C | `30:30:f9:1d:ab:d4` | 1.99 | 1.16 |
+| D | `dc:da:0c:77:6b:5c` | 1.31 | -2.87 |
 
-- Channel decorrelates below 0.5 in **~39 ms** during motion, implying **>=51 Hz**
-  per link. Fixed-TX gives 49.8 Hz (marginal). Round-robin gives ~5 Hz effective
-  (bursty, jitter CV 0.87) — roughly 10x too slow. **Round-robin as configured is
-  not suitable for pose estimation**; it trades exactly the resource pose needs.
+Layout is unique only up to reflection; C is placed on +y by convention. Hull
+area ~9.5 m², centroid ~(2.0, -0.4), and both the A-B and C-D links pass within
+~0.45 m of it, so that is where a subject should stand.
 
-Conclusions that are confounded and need re-testing:
+Caveat: 4 points in a plane have 5 degrees of freedom and 6 distances, so there
+is exactly one redundant check. It passing rules out a gross single-measurement
+error but not a systematic bias (e.g. always measuring to the USB end).
 
-- "Only 2 principal components explain 95% of variance" — a single hand blocking
-  line-of-sight is an inherently low-dimensional stimulus, so this probably
-  reflects the stimulus, not an information limit of the hardware.
-- "3.85x motion-vs-static variation" — blocking LoS directly is the strongest
-  possible perturbation, so this is an optimistic ceiling, not typical.
+## RSSI is useless for distance here -- localization by multilateration is dead
 
-### Next step
+With true distances known, measured RSSI correlates **positively** with distance
+(+0.59), giving a fitted path-loss exponent of **-2.92** (free space is +2.0,
+indoor 2-4; negative is unphysical). Concretely CD spans 4.09 m at -39.3 dBm
+while BC spans 2.95 m at -55.6 dBm -- the shorter link is 16 dB weaker.
+Reciprocity is fine (asymmetry 0.0-2.8 dB), so this is the propagation
+environment, not the hardware. Multipath and orientation dominate distance
+completely at room scale. This confirms, with ground truth, the earlier failure
+where MDS produced a non-Euclidean distance matrix.
 
-Re-run with geometry appropriate to the task: **four boards at the corners of a
-~2-3 m square**, upright, at torso height; subject in the middle doing full-body
-motion. That gives crossing paths through the subject from several directions
-instead of one axis. Then repeat static + moving captures in fixed-TX mode and
-compare against the numbers above.
+CSI fingerprinting against surveyed positions remains plausible; RSSI
+trilateration does not.
 
-Also worth trying:
-- Raise fixed-TX ping rate toward ~140 Hz (headroom exists; currently 50 Hz).
-- Restore phase, which was stripped for bandwidth — likely matters more for
-  effective dimensionality than raw sample rate does.
+## Pose-estimation assessment
 
-## Localization idea — not started
+Measured with `capture_wizard.py` (three conditions: empty room / person still /
+person moving) and `analyze_wizard.py`. The empty-room reference is what an
+earlier attempt lacked, and it passed its drift check this time (ratio 0.0-0.4,
+lag-1 autocorr ~0, i.e. a genuine white-noise floor).
 
-Plan discussed: place boards on a known grid, permute which board sits at which
-point, and fit position from the link data. Note RSSI multilateration was tried
-on the 5-board data and **failed** — the distance matrix came out non-Euclidean
-(negative eigenvalues), because orientation and multipath dominate RSSI at this
-scale. CSI fingerprinting against surveyed positions is the more promising route.
+**Presence is trivially detectable.** A *motionless* person shifts the channel
+mean by z = 16-66 sigma (mean 27.5 across 12 links). An earlier read of
+"undetectable" was wrong: it compared variances, which are blind to a constant
+offset. This matters because it means body configuration is encoded in the
+static channel signature, not only in motion -- the precondition for reading a
+held pose.
+
+**Motion is clearly detectable.** Round-robin 3.45x vs empty, fixed-TX 2.14x.
+
+**Round-robin beats fixed-TX for this task**, reversing an earlier verdict that
+was based on sampling rate alone:
+
+| mode | links | rate | motion vs empty | effective rank |
+|---|---|---|---|---|
+| fixed-TX | 3 | 46 Hz | 2.14x | 6 |
+| round-robin | 12 | 5 Hz | 3.45x | 9 |
+
+**The real limit is dimensionality, not rate.** After removing the empty-room
+mean, the moving data has an effective rank of only 6-9 (95% of variance) out of
+576-2304 raw features. A human skeleton is 30-60 DOF, so full skeletal pose is
+underdetermined by roughly 5x. Feasible: presence, occupancy, activity
+recognition, coarse pose classification. Not feasible with this setup: dense
+skeletal pose.
+
+Caveat on that rank figure: it was measured on a single motion sequence (arms,
+turn, squat). A low rank may partly reflect limited motion diversity rather than
+a sensor limit -- the same confound that made the earlier line-geometry numbers
+useless.
+
+### Next steps
+
+- **Static pose discrimination** is the right next experiment: capture several
+  distinct held poses and measure separability. Since a motionless person is
+  detectable at z~27, this tests pose-reading capacity directly instead of
+  inferring it from one motion sequence.
+- **Restore phase** (stripped for UART bandwidth). Likely raises effective rank
+  more than any sampling change.
+- More boards would add links, but note 12 links only bought rank 9 -- returns
+  are sublinear because links and subcarriers are highly redundant.
+
+## Localization idea -- not started
+
+Grid + permutation plan still open. Note the RSSI finding above: use CSI
+fingerprinting, not RSSI multilateration.
