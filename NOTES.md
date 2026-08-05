@@ -209,15 +209,46 @@ outright would leave the matrix unstructured. Neither is what we see.
 Confound: position and time both changed between sessions, so their
 contributions cannot be separated here. Position is very likely dominant.
 
+### Fixed-TX poses, and a controlled rate test
+
+Fixed-TX pose capture (board A transmitting, 3 links at 41.5 Hz), same six
+poses: **97.9%** temporal split, median separability 24.2, two errors in 97 test
+windows.
+
+Decimating that same capture -- same session, same position, same links, only
+the rate reduced -- isolates the effect of sample rate:
+
+| per-link rate | accuracy |
+|---|---|
+| 41.5 Hz | 97.9% |
+| 20.8 Hz | 96.9% |
+| 10.4 Hz | 96.9% |
+| 6.9 Hz | 93.8% |
+
+**Sample rate barely matters for held poses.** A 4x decimation costs one point.
+This makes sense in retrospect: a held pose has no temporal content to resolve,
+so what is needed is a clean spatial signature rather than a fast one. It also
+refutes the earlier prediction here that fixed-TX would beat round-robin *via*
+its higher rate.
+
+**The mode comparison is therefore still not resolved, and probably cannot be
+from this data.** At matched rate and link count fixed-TX scores 96.9% against
+the round-robin 3-link subset's 82.5-84.5%, but those come from different
+sessions and standing positions, and round-robin's own two sessions spanned
+88.7% to 100%. Session-to-session variation is as large as the gap that would
+be attributed to mode. Settling it needs both modes captured back-to-back from
+one position.
+
+Practical consequence: round-robin's ~9.5 Hz per-link rate, flagged early in
+this project as disqualifying for pose work, is **not** a handicap for static
+pose. Rate would only matter for tracking motion, which is a different task.
+
 ### Next steps
 
-1. **Train across multiple standing positions** (3-5 spots), not one. This is
-   the standard fix for the generalization problem above, and the +0.57
-   diagonal indicates there is real invariant signal to learn. Single-position
-   training demonstrably does not transfer.
-2. **A better classifier than nearest-centroid.** The information is present but
-   the margins are thin; LDA or a small network with several sessions of data
-   is the obvious next try.
-3. **Fixed-TX pose capture**, still never recorded -- the mode comparison for
-   poses remains open.
+1. **Train across multiple standing positions** (3-5 spots). Still the single
+   most valuable next dataset -- see the cross-session result above.
+2. **A better classifier than nearest-centroid**, once multi-position data
+   exists.
+3. **Mode comparison back-to-back from one position**, if it matters; both
+   modes already work well enough that this is low priority.
 4. **Restore phase** (stripped for UART bandwidth).
