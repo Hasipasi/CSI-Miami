@@ -87,14 +87,20 @@ def main():
     valid = base_sc > 1.0          # guard-band subcarriers are ~0 and would divide to noise
     S = S[:, valid]
 
-    # ---- panel C data: raw packets, empty then each pose ------------------
+    # ---- panel C data: per-packet, normalised per subcarrier --------------
+    # Each subcarrier is divided by its OWN empty-room level before plotting.
+    # Raw amplitude is dominated by static frequency-selective fading -- strong
+    # horizontal banding that is a property of the room, not of the person --
+    # and that banding swamps the change we actually want to see. Normalising
+    # per subcarrier removes it and puts every subcarrier on the same dB scale.
+    ref_sc = E[f'{key_lk}|a'].astype(float)[:, valid].mean(axis=0)
     segs, bounds, seg_lab = [], [], []
     for tag, d in [('empty', E)] + [(SHORT[i], P[p]) for i, p in enumerate(POSES)]:
         a = d[f'{key_lk}|a'].astype(float)[:, valid]
-        segs.append(a)
+        segs.append(20 * np.log10(np.maximum(a, 1e-9) / np.maximum(ref_sc, 1e-9)[None, :]))
         bounds.append(sum(len(s) for s in segs))
         seg_lab.append(tag)
-    RAW = np.vstack(segs).T          # [subcarrier x packet]
+    RAW = np.vstack(segs).T          # [subcarrier x packet], dB vs own empty level
 
     def sym_limit(arr, floor=1.0):
         """Symmetric colour limit about zero. Guarded: an all-NaN or all-zero
@@ -157,8 +163,9 @@ def main():
 
     # ================= panel C =================
     ax3 = fig.add_subplot(gs[1, :], facecolor=SURFACE)
-    im3 = ax3.imshow(RAW, cmap=SEQ, aspect='auto', interpolation='nearest',
-                     vmin=0, vmax=np.percentile(RAW, 99))
+    limR = max(float(np.ceil(np.nanpercentile(np.abs(RAW), 99) / 2) * 2), 1.0)
+    im3 = ax3.imshow(RAW, cmap=DIVERGING, aspect='auto', interpolation='nearest',
+                     vmin=-limR, vmax=limR)
     for b in bounds[:-1]:
         ax3.axvline(b, color=SURFACE, lw=2.5)
         ax3.axvline(b, color=INK_2, lw=1.0, ls=(0, (3, 2)))
@@ -167,20 +174,20 @@ def main():
     mid = [(([0] + bounds)[i] + bounds[i]) / 2 for i in range(len(bounds))]
     ax3.set_xticks(mid, seg_lab, color=INK_2, fontsize=9.5)
     ax3.set_ylabel('subcarrier index', color=INK_2, fontsize=9.5)
-    ax3.set_title(f'C · The raw packets behind panels A and B — {key_name}, '
-                  'every captured packet in sequence',
+    ax3.set_title(f'C · Every captured packet — {key_name}, each subcarrier '
+                  'normalised against its own empty-room level',
                   color=INK, fontsize=12, pad=8, loc='left', fontweight='bold')
     ax3.tick_params(colors=INK_2, length=0, labelsize=9)
     for s in ax3.spines.values():
         s.set_visible(False)
     cb3 = fig.colorbar(im3, ax=ax3, fraction=0.018, pad=0.012)
-    cb3.set_label('CSI amplitude (raw units)', color=INK_2, fontsize=9)
+    cb3.set_label('change vs empty, per subcarrier (dB)', color=INK_2, fontsize=9)
     cb3.ax.tick_params(colors=INK_2, length=0, labelsize=8)
     cb3.outline.set_visible(False)
-    ax3.text(0.0, -0.155, f'{RAW.shape[1]} packets × {RAW.shape[0]} subcarriers. '
-                          'Each block is one held pose; the empty room is the reference at left. '
-                          'Vertical structure is frequency-selective fading, and it visibly '
-                          'changes from block to block.',
+    ax3.text(0.0, -0.155, f'{RAW.shape[1]} packets × {RAW.shape[0]} subcarriers. Each block is one '
+                          'held pose; the empty block at left is flat by construction (it is the reference). '
+                          'Without this normalisation the panel is dominated by static fading — a property of '
+                          'the room, not the person.',
              transform=ax3.transAxes, fontsize=9, color=MUTED, va='top')
 
     net = np.nanmean(M)
