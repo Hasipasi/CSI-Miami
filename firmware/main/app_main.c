@@ -54,21 +54,70 @@
 #define CONFIG_ESP_NOW_PHYMODE              WIFI_PHY_MODE_HT40
 #define CONFIG_ESP_NOW_RATE                 WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_FORCE_GAIN                   0
-// CSI-trigger pings/sec while holding the token. UART bandwidth is the limit, and
-// the binary frame below is what moved it: a record is 212 B (18 hdr + 192 + 2 sum)
-// against 626 B for the CSV it replaced, with no subcarrier discarded.
+// CSI-trigger pings/sec while holding the token. UART bandwidth is the limit, and the
+// binary frame is what moved it: 82 B for 30 complex subcarriers, against 626 B for
+// the CSV this replaced.
 //
 // The number that matters is burst load -- a receiver sees the full ping rate while
-// its transmitter holds the token. 50 Hz x 626 B = 31.3 KB/s of the 92.2 KB/s link
-// ran for a whole session with zero corrupt lines, so that is the proven-safe load.
-// At 30 subcarriers a frame is 50 B and 250 Hz costs only 12.5 KB/s, but that subset
-// is not currently sent -- see CONFIG_SUB_COUNT.
+// its transmitter holds the token. 243 Hz x 354 B = 86.0 KB/s of the 92.2 KB/s link.
 //
-// Do not simply raise this to fill the arithmetic headroom: 100 Hz on the old CSV
-// encoding (62.6 KB/s burst, "68%, comfortable") produced corrupt lines within
-// minutes, because ets_printf blocks on a full TX FIFO and starves the UART command
-// task until its input overruns. Bandwidth is necessary, not sufficient.
-#define CONFIG_SEND_FREQUENCY              125
+// 243 is the measured knee minus 10%. The knee differs by subcarrier set, and for two
+// different reasons, which is worth knowing before changing either:
+//
+//   SUB 30   knee ~750 Hz at only ~65% UART. NOT bandwidth -- it is per-frame cost
+//            (mutex, per-byte ROM writes, ESP-NOW send rate). Small frames hit this
+//            long before they fill the wire. Pair with 675 Hz and a 12.5 ms dwell.
+//   SUB 166  knee ~270 Hz at ~97% UART. This one really is bandwidth: 354 B a frame
+//            is 3.84 ms of wire, so the link is ~93% busy at 243 Hz. Currently in use.
+//
+// Changing CONFIG_SUB_COUNT means changing this too, and the dwell with it -- they are
+// not independent knobs. See the table in NOTES.md before touching any of the three.
+//
+// Note this is the *ping* rate, not the per-link rate. In round-robin each board holds
+// the token a quarter of the time, so a link averages a quarter of this.
+//
+// And "averages" is doing real work in that sentence. A link is sampled in a dense
+// burst for its transmitter's whole dwell and then not at all for the rest of the
+// cycle -- measured at 50 ms dwell: 2.25 ms median spacing inside the burst, but a
+// 165 ms p99 gap, 16% duty. Raising this number makes bursts denser; it does not
+// shrink the gap. Shorten the host's --round-duration for that.
+//
+// The old warning here said not to fill the arithmetic headroom, because 100 Hz of
+// CSV (62.6 KB/s, "68%, comfortable") corrupted within minutes. That was measured
+// again against this encoding and the limit is not where it looked: swept 400-1000 Hz,
+// corruption was zero at every rate, up to 84% of the link, with boards still
+// accepting commands. The culprit was never the byte count -- ets_printf *formatted*
+// each line while holding the TX FIFO, where this path writes prepared bytes. 400 is
+// chosen for headroom, not because it is the ceiling.
+//
+// Still: this is a power-on default, and "RATE <hz>" retunes it at runtime, so the
+// ceiling can be re-measured on real hardware instead of argued about -- which is how
+// the number above was corrected in the first place. RATE does not persist: the host
+// resets every board when it discovers them, so a recording always runs at whatever
+// is compiled in here. Sweep with RATE, then set this and reflash.
+#define CONFIG_SEND_FREQUENCY              243
+// Send raw I/Q instead of computed amplitude (frame version 2 rather than 1).
+//
+// Amplitude throws away phase, and phase is where path-length change lives -- a
+// target moving a fraction of a wavelength shifts phase long before it shows in
+// magnitude. The cost is two bytes per subcarrier instead of one, which is why this
+// is paired with the 30-subcarrier subset below: 30 complex subcarriers is a 82 B
+// frame against 212 B for 192 amplitudes, so it buys rate *and* phase at once.
+//
+// I/Q is sent raw, uncompensated, with the AGC compensation factor carried in the
+// header for the host to apply. Scaling on the board would have to round back into
+// int8 and would throw away the low bits the phase estimate rests on.
+#define CONFIG_IQ_MODE                        1
+
+#if CONFIG_IQ_MODE
+#define CSI_FRAME_VERSION                     2
+#define CSI_FRAME_HDR                        20     // 2 extra bytes carry the AGC gain
+#define CSI_BYTES_PER_SUB                     2
+#else
+#define CSI_FRAME_VERSION                     1
+#define CSI_FRAME_HDR                        18
+#define CSI_BYTES_PER_SUB                     1
+#endif
 // Which subcarriers to transmit. The ESP32 reports 192 for HT40: 0-63 is the legacy
 // LLTF (measured 5x weaker, mean 8.3 vs ~39), and 64-191 is the real 40 MHz estimate
 // as two 20 MHz halves with the DC/guard gap at 123-133. These 30 are spaced evenly
@@ -76,16 +125,60 @@
 // link-captures, so they cover the full band rather than half of it. Measured mean
 // amplitude at these indices is 29-67 -- no weak picks.
 //
-// Currently 0: send all 192 and let analysis decide what to keep. Subsetting is a
-// preprocessing choice, and doing it here would bake it into the recordings
-// irreversibly. Set to 30 to emit the table below instead (frame 212 B -> 50 B, which
-// is what buys ping rate); nothing downstream is hardcoded either way, since the frame
-// carries its own n_sub and the host sizes arrays from it.
-#define CONFIG_SUB_COUNT                      0
-static const uint8_t SUB_INDEX[CONFIG_SUB_COUNT] = {
+// Subsetting here bakes the choice into the recordings irreversibly, which is why the
+// amplitude campaign sent all 192 and let analysis decide. It is the right trade for
+// I/Q, where every subcarrier costs two bytes: 30 evenly-spaced ones reconstruct all
+// 166 live at R^2 = 0.973, and the bytes saved buy rate.
+//
+// Three sets, selectable at runtime with "SUB <n>" so the trade can be measured on
+// hardware rather than argued:
+//   0    all 192, whatever the radio reports, dead subcarriers included
+//   30   evenly spaced across the usable span -- 118 Hz per link, 71 ms blind gap
+//   166  every live subcarrier, 192 minus the 26 structurally dead. Currently in use:
+//        full frequency resolution, at 48 Hz per link and a 101 ms blind gap.
+//
+// 166 is the deliberate choice here even though 30 measures better on rate and gap:
+// R^2 = 0.973 is a reconstruction of the *recorded amplitude* band, and nothing has
+// yet checked that it holds for phase. Sending everything keeps that question open
+// rather than answering it by assumption -- subsetting is reversible in analysis,
+// discarding at the boards is not.
+#define CONFIG_SUB_COUNT                    166
+static const uint8_t SUB_INDEX_30[30] = {
     66, 70, 74, 78, 82, 85, 89, 93, 97, 101, 105, 109, 113, 117, 121,
     135, 139, 143, 147, 151, 155, 159, 163, 167, 171, 174, 178, 182, 186, 190,
 };
+// The 26 excluded are 0-5, 32, 59-65, 123-133 and 191: guard bands and DC. Measured
+// over 144 link-captures of the recorded campaign, identical in every one -- this is
+// the hardware's band plan, not a property of any particular session.
+static const uint8_t SUB_INDEX_166[166] = {
+    6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36,
+    37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+    52, 53, 54, 55, 56, 57, 58, 66, 67, 68, 69, 70, 71, 72, 73,
+    74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88,
+    89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103,
+    104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118,
+    119, 120, 121, 122, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144,
+    145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
+    160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174,
+    175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189,
+    190,
+};
+// Live selection, settable with "SUB <n>". Same discipline as ping rate: this does not
+// persist across the reset the host issues on discovery, so a recording runs at
+// CONFIG_SUB_COUNT. Sweep with the command, then set the define and reflash.
+static volatile int sub_count = CONFIG_SUB_COUNT;
+
+static const uint8_t *sub_table(int n)
+{
+    if (n == 30) {
+        return SUB_INDEX_30;
+    }
+    if (n == 166) {
+        return SUB_INDEX_166;
+    }
+    return NULL;                      // 0 or anything unrecognised: send everything
+}
 
 #define CONFIG_GAIN_CONTROL                  1     // all our boards are ESP32-S3
 
@@ -111,6 +204,11 @@ static uint8_t tx_filter_mac[6] = {0}; // whichever MAC we should currently acce
 static led_strip_handle_t led_strip;
 static esp_timer_handle_t ping_timer;
 static void ping_timer_cb(void *arg);   // become_tx() fires one ping directly
+// Ping period, settable at runtime with "RATE <hz>". The UART ceiling is an empirical
+// number -- bandwidth arithmetic has already been shown to be necessary but not
+// sufficient here -- so it has to be swept against real corruption counts, and
+// reflashing every board per data point made that too slow to bother doing.
+static volatile uint32_t ping_period_us = 1000000 / CONFIG_SEND_FREQUENCY;
 
 static void set_led(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -145,7 +243,7 @@ static void become_tx(void)
         set_led(0, 0, 40); // blue = holding the TX token
     }
     esp_timer_stop(ping_timer); // ignored if not running
-    ESP_ERROR_CHECK(esp_timer_start_periodic(ping_timer, 1000000 / CONFIG_SEND_FREQUENCY));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(ping_timer, ping_period_us));
     // Fire once immediately: a periodic timer's first callback lands one full period
     // after the start, so restarting it on every handoff left the first interval of
     // every dwell silent. At a 50 ms dwell that was 40% of the turn, and it is why
@@ -211,7 +309,13 @@ static void uart_command_task(void *arg)
             // Overruns get likelier as print pressure rises, since ets_printf blocks
             // on a full TX FIFO and starves this task.
             clearerr(stdin);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            // 1 ms, not 10. stdin is non-blocking, so this delay *is* the command
+            // latency, and a role change cannot take effect until this task next
+            // looks. At 10 ms it cost ~5 ms of every dwell on average -- 17% of a
+            // 50 ms dwell and 39% of a 12.5 ms one, which is what made short dwells
+            // lose more than they gained. The tick is already 1 kHz, so 1 ms is one
+            // tick: the shortest wait that still yields the CPU.
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
         line[strcspn(line, "\r\n")] = '\0';
@@ -236,6 +340,36 @@ static void uart_command_task(void *arg)
                 set_led(r & 0xff, g & 0xff, b & 0xff);
             } else {
                 ESP_LOGW(TAG, "bad LED command: '%s'", line);
+            }
+        } else if (strncmp(line, "RATE ", 5) == 0) {
+            // Retune the ping rate live. Takes effect on the current dwell if this
+            // board is transmitting, otherwise on its next turn with the token.
+            unsigned hz;
+            if (sscanf(line + 5, "%u", &hz) == 1 && hz >= 1 && hz <= 2000) {
+                ping_period_us = 1000000 / hz;
+                if (is_tx) {
+                    esp_timer_stop(ping_timer);
+                    esp_timer_start_periodic(ping_timer, ping_period_us);
+                }
+                xSemaphoreTake(print_mux, portMAX_DELAY);
+                ets_printf("RATE_OK,%u\n", hz);  // ets_printf: see become_tx()
+                xSemaphoreGive(print_mux);
+            } else {
+                ESP_LOGW(TAG, "bad RATE command: '%s'", line);
+            }
+        } else if (strncmp(line, "SUB ", 4) == 0) {
+            // Switch subcarrier set live: 0 (all), 30, or 166. Takes effect on the
+            // next CSI callback, and the frame carries its own n_sub, so the host
+            // resizes from the wire rather than being told separately.
+            unsigned nsc;
+            if (sscanf(line + 4, "%u", &nsc) == 1
+                && (nsc == 0 || nsc == 30 || nsc == 166)) {
+                sub_count = (int)nsc;
+                xSemaphoreTake(print_mux, portMAX_DELAY);
+                ets_printf("SUB_OK,%u\n", nsc);  // ets_printf: see become_tx()
+                xSemaphoreGive(print_mux);
+            } else {
+                ESP_LOGW(TAG, "bad SUB command: '%s'", line);
             }
         } else if (strcmp(line, "IDENT") == 0) {
             ident_mode = true;
@@ -295,38 +429,52 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     uint32_t rx_id = *(uint32_t *)(info->payload + 15);
     (void)rx_id;
     if (!s_count) {
-        ESP_LOGI(TAG, "================ CSI RECV (binary CSI1 frames) ================");
+        ESP_LOGI(TAG, "========== CSI RECV (binary CSI%d frames) ==========", CSI_FRAME_VERSION);
     }
 
     // Binary frame instead of a CSV line. ASCII decimal spent ~3.5 bytes encoding
     // one byte of information -- 626 B per record where the payload is 192 bytes --
-    // and UART bandwidth is the hard limit on ping rate. uint8 amplitudes cut a
-    // record to 212 B with no subcarrier discarded, so the rate rises ~3x without
-    // trading away frequency resolution.
+    // and UART bandwidth is the hard limit on ping rate.
     //
-    //   0    2  magic 0xA5 0x5A
-    //   2    1  version (1)
-    //   3    1  n_sub
-    //   4    6  transmitter MAC
-    //  10    1  rssi          (int8)
-    //  11    1  noise_floor   (int8)
-    //  12    4  local_timestamp, microseconds, little-endian
-    //  16    1  clipped count (amplitudes above 255, saturating)
-    //  17    1  first_word_invalid
-    //  18   ns  amplitudes, uint8
-    //  18+ns 2  sum16 of bytes [2, 18+ns), little-endian
+    // Two payload encodings, distinguished by the version byte so one host parser
+    // reads both and the amplitude recordings stay readable forever:
+    //
+    //   version 1, amplitude      version 2, raw I/Q
+    //   0    2  magic 0xA5 0x5A    0    2  magic 0xA5 0x5A
+    //   2    1  version (1)        2    1  version (2)
+    //   3    1  n_sub              3    1  n_sub
+    //   4    6  transmitter MAC    4    6  transmitter MAC
+    //  10    1  rssi        int8  10    1  rssi        int8
+    //  11    1  noise_floor int8  11    1  noise_floor int8
+    //  12    4  timestamp us LE   12    4  timestamp us LE
+    //  16    1  clipped count     16    2  gain x256, uint16 LE
+    //  17    1  first_word_inval  18    1  first_word_invalid
+    //  18   ns  amplitude uint8   19    1  reserved (0)
+    //                             20  2ns  (imag, real) int8 pairs
+    //  18+ns 2  sum16             20+2ns 2 sum16
+    //
+    // sum16 always covers [2, payload_end) little-endian.
+    //
+    // Version 2 sends I/Q *uncompensated* and passes the AGC compensation factor in
+    // the header. Applying it on the board means rounding a scaled value back into
+    // int8, which costs exactly the low-order bits the phase estimate is built on;
+    // the host has floats and can apply it for free. Clipping cannot occur, so that
+    // counter is what the gain field replaces.
     int n_avail = info->len / 2;
     if (n_avail > 255) {
         n_avail = 255;                     // n_sub is one byte
     }
-    // Emit a fixed subset when configured. Frame drops 212 B -> 50 B, which is what
-    // buys the ping rate; the trade is frequency resolution, not band coverage.
-    int n_sub = (CONFIG_SUB_COUNT > 0 && n_avail > SUB_INDEX[CONFIG_SUB_COUNT - 1])
-                ? CONFIG_SUB_COUNT : n_avail;
-    uint8_t frame[18 + 255 + 2];
+    // Emit a fixed subset when configured, falling back to everything if the radio
+    // reported fewer subcarriers than the table indexes into. Read the selection once:
+    // a "SUB <n>" arriving mid-frame must not change the width between the length
+    // field and the payload loop.
+    int want = sub_count;
+    const uint8_t *tbl = sub_table(want);
+    int n_sub = (tbl && n_avail > tbl[want - 1]) ? want : n_avail;
+    uint8_t frame[CSI_FRAME_HDR + CSI_BYTES_PER_SUB * 255 + 2];
     frame[0] = 0xA5;
     frame[1] = 0x5A;
-    frame[2] = 1;
+    frame[2] = CSI_FRAME_VERSION;
     frame[3] = (uint8_t)n_sub;
     memcpy(&frame[4], info->mac, 6);
     frame[10] = (uint8_t)(int8_t)rx_ctrl->rssi;
@@ -336,11 +484,30 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     frame[13] = (uint8_t)((ts >> 8) & 0xff);
     frame[14] = (uint8_t)((ts >> 16) & 0xff);
     frame[15] = (uint8_t)((ts >> 24) & 0xff);
-    frame[17] = (uint8_t)info->first_word_invalid;
 
+#if CONFIG_IQ_MODE
+    // Q8.8 fixed point. Saturating rather than wrapping: a wrapped gain would look
+    // like a plausible small number and silently rescale that packet alone.
+    int gain_q8 = (int)(compensate_gain * 256.0f + 0.5f);
+    if (gain_q8 < 0) {
+        gain_q8 = 0;
+    } else if (gain_q8 > 65535) {
+        gain_q8 = 65535;
+    }
+    frame[16] = (uint8_t)(gain_q8 & 0xff);
+    frame[17] = (uint8_t)(gain_q8 >> 8);
+    frame[18] = (uint8_t)info->first_word_invalid;
+    frame[19] = 0;
+    for (int i = 0; i < n_sub; i++) {
+        int k = (n_sub == n_avail) ? i : tbl[i];
+        frame[CSI_FRAME_HDR + 2 * i]     = (uint8_t)info->buf[k * 2];      // imag
+        frame[CSI_FRAME_HDR + 2 * i + 1] = (uint8_t)info->buf[k * 2 + 1];  // real
+    }
+#else
+    frame[17] = (uint8_t)info->first_word_invalid;
     unsigned clipped = 0;
     for (int i = 0; i < n_sub; i++) {
-        int k = (n_sub == n_avail) ? i : SUB_INDEX[i];
+        int k = (n_sub == n_avail) ? i : tbl[i];
         float imag = compensate_gain * (int8_t)info->buf[k * 2];
         float real = compensate_gain * (int8_t)info->buf[k * 2 + 1];
         int amp = (int)(sqrtf(imag * imag + real * real) + 0.5f);
@@ -350,22 +517,24 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
             amp = 255;
             clipped++;
         }
-        frame[18 + i] = (uint8_t)amp;
+        frame[CSI_FRAME_HDR + i] = (uint8_t)amp;
     }
     frame[16] = (uint8_t)(clipped > 255 ? 255 : clipped);
+#endif
 
+    int n_end = CSI_FRAME_HDR + CSI_BYTES_PER_SUB * n_sub;
     uint16_t sum = 0;
-    for (int i = 2; i < 18 + n_sub; i++) {
+    for (int i = 2; i < n_end; i++) {
         sum = (uint16_t)(sum + frame[i]);
     }
-    frame[18 + n_sub] = (uint8_t)(sum & 0xff);
-    frame[19 + n_sub] = (uint8_t)(sum >> 8);
+    frame[n_end] = (uint8_t)(sum & 0xff);
+    frame[n_end + 1] = (uint8_t)(sum >> 8);
 
     // Same UART path as ets_printf (direct ROM writes to the FIFO), so binary frames
     // and ROLE_* text stay strictly ordered. The mutex keeps a role marker from the
     // command task out of the middle of a frame.
     xSemaphoreTake(print_mux, portMAX_DELAY);
-    for (int i = 0; i < 20 + n_sub; i++) {
+    for (int i = 0; i < n_end + 2; i++) {
         esp_rom_uart_tx_one_char(frame[i]);
     }
     xSemaphoreGive(print_mux);

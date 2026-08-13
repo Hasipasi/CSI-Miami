@@ -205,6 +205,10 @@ class Live(QWidget):
         self.last_seen = {m: time.time() for m in self.macs}
         self.read_errors = 0
         self.clipped = 0
+        # Whatever width the boards are actually sending: 192 amplitudes or 30 I/Q,
+        # depending on the firmware they are running. Read off the wire rather than
+        # assumed, so the caption cannot claim a layout the data does not have.
+        self.n_sub = 0
         # CLOCK_MONOTONIC to wall clock, measured once: the two drift far too slowly
         # to matter across a run, and re-measuring per frame would inject exactly the
         # scheduling jitter the driver timestamp exists to avoid.
@@ -395,13 +399,14 @@ class Live(QWidget):
             try:
                 recs, _lines = st.feed(data)
                 now = time.time()
-                for tx, lts, rssi, amp, clipped in recs:
+                for tx, lts, rssi, amp, clipped, iq in recs:
                     key = (tx, rx)
                     self.last_seen[rx] = now
                     self.clipped += clipped
+                    self.n_sub = len(amp)
                     rec = self.rec   # single read: stop_record may clear it mid-loop
                     if rec is not None:
-                        rec['recs'][rx].append((now, tx, lts, rssi, amp))
+                        rec['recs'][rx].append((now, tx, lts, rssi, amp, iq))
                     with self.lock:
                         if key not in self.buf:
                             continue
@@ -849,8 +854,9 @@ class Live(QWidget):
         self.note.setText(
             f'<b>{mean_cols:.0f}/{NPKT}</b> columns · these {NPKT} packets span '
             f'<b>{mean_span * 1000:.0f} ms</b> · ~{mean_rate:.0f} pkt/s per link · '
-            f'z-scored within each {SUB_BLOCK}-wide CSI field, guard bands excluded '
-            f'from the statistics but still drawn. '
+            + (f'z-scored within each {SUB_BLOCK}-wide CSI field, guard bands excluded '
+               f'from the statistics but still drawn. ' if self.n_sub > SUB_BLOCK else
+               f'{self.n_sub} subcarriers, z-scored per packet. ')
             + (f'Round-robin: with the token shared across {len(self.panels)} links '
                f'each is sampled every {self.args.round_duration * len(self.macs) * 1000:.0f} ms, '
                'so the same 20 columns cover a much longer span. Timestamps are what '
@@ -891,7 +897,10 @@ def main():
     ap.add_argument('--tx', default='round-robin',
                     help='"round-robin", or a board label (A/B/C/D) to pin the '
                          'transmitter. Switchable in the GUI at any time.')
-    ap.add_argument('--round-duration', type=float, default=0.05)
+    ap.add_argument('--round-duration', type=float, default=0.025,
+                    help='seconds each board holds the transmit token; sets the blind '
+                         'gap between a link\'s bursts. 25 ms is the measured optimum '
+                         'for 166 subcarriers, 12.5 ms for 30 -- see capture.py.')
     ap.add_argument('--prefix', default='run', help='default capture name in the GUI')
     ap.add_argument('--outdir', default=None,
                     help='directory for captures (default: the repo data/ folder)')

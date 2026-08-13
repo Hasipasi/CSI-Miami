@@ -16,7 +16,11 @@ import sys
 
 import numpy as np
 
-EXPECT_SUB = 192
+# Widths the firmware is known to emit: 192 amplitudes (frame v1) or the 30-subcarrier
+# subset (v2 I/Q). Pinning one number here would fail every capture the moment the
+# encoding changed, so what is enforced is that every link within a take agrees --
+# a take that mixes widths is broken in a way no single expected value would catch.
+KNOWN_SUB = (192, 166, 30)
 
 
 def links(d):
@@ -54,14 +58,13 @@ def check(path):
         probs.append('frame timestamps not monotonic')
 
     lks = links(d)
-    counts, worst_dt = {}, 0.0
+    counts, worst_dt, widths = {}, 0.0, {}
     for lk in lks:
         tx, rx = lk.split('|')
         nm = f'{lab.get(tx, tx[-5:])}->{lab.get(rx, rx[-5:])}'
         a, t = d[f'{lk}|a'], d[f'{lk}|t'].astype(np.float64)
         counts[nm] = len(t)
-        if a.shape[1] != EXPECT_SUB:
-            probs.append(f'{nm}: {a.shape[1]} subcarriers, expected {EXPECT_SUB}')
+        widths.setdefault(a.shape[1], []).append(nm)
         if len(t) > 1 and not np.all(np.diff(t) >= 0):
             probs.append(f'{nm}: packet times not monotonic')
         # a dead or stuck link still writes a well-formed array
@@ -71,8 +74,30 @@ def check(path):
             probs.append(f'{nm}: amplitudes constant (stuck)')
         if a.size and float(np.mean(a.sum(axis=1) == 0)) > 0.05:
             probs.append(f'{nm}: {100 * np.mean(a.sum(axis=1) == 0):.0f}% all-zero packets')
+        # Phase, when the boards sent I/Q. Raw phase is carrier/sampling offset and
+        # looks like noise by design, so the check is on the detrended residual --
+        # that is the part that carries channel information, and it being frozen or
+        # non-finite means the complex payload is not usable even though |iq| is.
+        if f'{lk}|iq' in d.files:
+            q = d[f'{lk}|iq']
+            if not np.isfinite(q).all():
+                probs.append(f'{nm}: non-finite iq')
+            elif len(q) > 2 and q.shape[1] > 3:
+                ph = np.unwrap(np.angle(q), axis=1)
+                idx = np.arange(q.shape[1])
+                c = np.polyfit(idx, ph.T, 1)
+                res = ph - (np.outer(idx, c[0]) + c[1]).T
+                if float(res.std()) == 0.0:
+                    probs.append(f'{nm}: detrended phase constant (stuck)')
         if f'{lk}|dt' in d.files and len(d[f'{lk}|dt']):
             worst_dt = max(worst_dt, float(np.max(np.abs(d[f'{lk}|dt']))) * 1e3)
+
+    if len(widths) > 1:
+        probs.append('links disagree on subcarrier count: '
+                     + '; '.join(f'{w} ({len(v)} links)' for w, v in sorted(widths.items())))
+    for w in widths:
+        if w not in KNOWN_SUB:
+            probs.append(f'unexpected subcarrier count {w}, known are {KNOWN_SUB}')
 
     # A round-robin run should yield every ordered pair. Missing links are the
     # failure this whole script exists for: the files load, the counts look sane,

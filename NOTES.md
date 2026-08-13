@@ -312,4 +312,227 @@ pose. Rate would only matter for tracking motion, which is a different task.
    exists.
 3. **Mode comparison back-to-back from one position**, if it matters; both
    modes already work well enough that this is low priority.
-4. **Restore phase** (stripped for UART bandwidth).
+4. ~~**Restore phase** (stripped for UART bandwidth).~~ Done -- see below.
+
+## 2026-08-13 -- I/Q firmware, and the UART ceiling was never where we thought
+
+Everything below in one table. All three columns are **measured from real captures**
+of the same kind -- the first from `data/gergo_train/salute0.npz` (the recorded
+campaign), the other two from 20 s test captures -- and all use the same 12 links and
+the same statistics, so the columns are comparable rather than quoted from different
+kinds of run.
+
+| | campaign (v1) | I/Q, old dwell | I/Q 30 SC, tuned | **shipped: 166 SC** |
+|---|---|---|---|---|
+| payload | uint8 amplitude | int8 I/Q | int8 I/Q | int8 I/Q |
+| phase | no | yes | yes | **yes** |
+| subcarriers | 192 (166 live) | 30 | 30 | **166, all live** |
+| frame | 212 B | 82 B | 82 B | **354 B** |
+| ping rate | 125 Hz | 400 Hz | 675 Hz | **243 Hz** |
+| dwell | 50 ms | 50 ms | 12.5 ms | **25 ms** |
+| cycle (4 boards) | 200 ms | 200 ms | 50 ms | **100 ms** |
+| per-link rate | 25.8 Hz | 92.3 Hz | *118.4 Hz* | **43.5 Hz** (1.7x campaign) |
+| median gap | 8.19 ms | 1.86 ms | *1.39 ms* | **4.19 ms** |
+| p99 gap (blind window) | 192.5 ms | 165.8 ms | *71.4 ms* | **99.9 ms** (1.9x better) |
+| duty cycle | 14.0% | 12.0% | 10.7% | **14.6%** |
+| UART burst load | 26.5 KB/s (29%) | 32.8 KB/s (36%) | 55.4 KB/s (60%) | **86.0 KB/s (93%)** |
+| checksum failures | 0 | 0 | 0 | **0** |
+
+All four columns are **measured from real captures** with identical statistics over the
+same 12 links -- the first from `data/gergo_train/salute0.npz`, the rest from 20 s test
+captures -- so they compare like with like.
+
+**The shipped column is not the best on rate or gap, and that is the deliberate
+choice.** 30 SC wins on both (118 vs 43 Hz, 71 vs 100 ms). It was chosen anyway
+because the R^2 = 0.973 result that justifies 30 subcarriers was measured on recorded
+*amplitude*, and nothing has yet checked whether it holds for phase. Subsetting stays
+possible in analysis; discarding at the boards does not. Switch with `SUB 30` plus
+675 Hz and a 12.5 ms dwell if the rate turns out to matter more.
+
+**The three knobs are not independent.** Frame size sets the ping ceiling, and ping
+rate and frame size together set the best dwell: 166 SC is 3.84 ms of UART per frame,
+so a 12.5 ms dwell fits too few frames and measures *worse* than 25 ms (p99 106.6 vs
+101.2 ms). Change one, re-measure all three.
+
+Read the two gap rows together; they answer different questions. **Median** is spacing
+*inside* a burst and follows ping rate. **p99** is the blind window between bursts and
+follows dwell. Raising rate alone (column 2) barely moved p99: 192.5 -> 165.8 ms for
+3.2x the pings. Dwell is what moves it. Tune dwell first.
+
+Duty cycle sits at 11-15% throughout, which is arithmetic rather than a shortfall:
+duty is roughly dwell/cycle, and shortening dwell shortens both. What improves is how
+*often* a link is revisited.
+
+At 93% UART the shipped config has little headroom left, which is why it is the knee
+minus 10% rather than the knee. It sustained 20 s of real capture and a 15 s sweep
+with zero checksum failures and all boards responsive, but it is the closest to the
+edge anything here has run -- watch `check_session` on the first real session.
+
+Phase is back. `CONFIG_IQ_MODE` emits raw int8 I/Q as frame version 2 instead of
+computed uint8 amplitude, and `CONFIG_SUB_COUNT` is now 30. Those two go together:
+30 complex subcarriers is an 82 B frame against 212 B for 192 amplitudes, so phase
+costs *nothing* in bandwidth and buys rate at the same time. 192 complex would have
+been 404 B and not worth it.
+
+The version byte carries the format, so `capture.py` reads both encodings and the
+450 v1 takes stay readable through the same code path. `|iq|` reproduces the v1
+amplitude exactly, so amplitude-only consumers needed no changes at all.
+
+**I/Q is sent uncompensated with the AGC factor in the header.** Applying gain on
+the board means rounding a scaled value back into int8, which destroys exactly the
+low-order bits phase is estimated from. The host has floats; there it is free.
+
+### The 68% UART limit was an artefact of ets_printf, not of the UART
+
+Swept 400-1000 Hz with the settle window excluded: **zero checksum failures at every
+rate, up to 84% of the link**, every board still accepting commands afterwards. The
+CSV encoding corrupted at 68%. The difference is not bandwidth -- it is that
+`ets_printf` *formatted* each line while holding the FIFO, where the binary path
+writes bytes that are already prepared. The old note "bandwidth is necessary, not
+sufficient" was right about the mechanism and wrong about the number.
+
+An earlier sweep of mine reported 3-6 corrupt frames at the higher rates. That was
+my own measurement flushing the serial buffer mid-frame and charging the resync to
+the rate; the count was flat in rate, which is what gave it away. Excluding a 1.5 s
+settle window it is zero everywhere.
+
+Delivery sits at 93-95% at every rate. That shortfall is ESP-NOW broadcast loss and
+is flat in rate, so it is not a symptom of pushing too hard.
+
+`CONFIG_SEND_FREQUENCY` is 400 (~100 Hz per link in round-robin, against 26 before),
+which is a headroom choice, not a ceiling. A new `RATE <hz>` serial command retunes
+it live, so nobody has to reflash four boards to re-measure this again.
+
+### Raw phase is uniform noise; detrended phase is worth having
+
+Measured on a static scene, and worth stating plainly because it would be easy to
+plot raw phase, see structure that isn't there, and build on it:
+
+| | sd across packets |
+|---|---|
+| raw phase | 1.840 rad |
+| uniform random on [-pi, pi] | 1.814 rad |
+| after per-packet linear detrend across subcarrier index | **0.068 rad** |
+
+Absolute phase is carrier and sampling offset, redrawn every packet -- statistically
+indistinguishable from noise. Fit a line across subcarrier index within each packet,
+subtract it, and what remains is stable to ~0.07 rad. That 0.07 is the *static* noise
+floor, so motion must move phase more than that to be visible. **Anything consuming
+phase must detrend first**; the raw values are not a usable signal.
+
+Confirmed independently on a 20 s round-robin capture: 0.072 rad mean over all 12
+links, against 0.068 from the pinned-TX measurement.
+
+**Two different standard deviations live here, and they are easy to confuse** -- I
+briefly misread one as contradicting the other. Take the detrended residual `res`
+with shape [packets, subcarriers]:
+
+* `np.std(res, axis=0).mean()` = **0.07**. Temporal stability per subcarrier. This is
+  the noise floor, and the number quoted above.
+* `res.std()` = **0.6**. Pools subcarriers together, so it also contains the static
+  differences *between* subcarriers -- which is the channel's frequency response, i.e.
+  signal, not noise.
+
+The second is not a worse version of the first; it answers a different question.
+
+### Endurance, since throughput alone never was the failure mode
+
+6 min round-robin at 400 Hz with the real 50 ms dwell: **387,045 frames, 0 checksum
+failures, no link ever silent, all four boards still accepting commands afterwards**,
+across 23,672 role changes. Role changes under print pressure are exactly what used to
+starve the UART command task, so that count is the part that matters. Repeated at the
+final 675 Hz for 3 min: 274,339 frames, 0 failures, all responsive, 127 Hz per link
+against 26 Hz on the amplitude firmware.
+
+### Where each subcarrier set actually breaks
+
+Pushed past the knee on purpose -- a ceiling nobody has watched fail is the top of
+someone's sweep, not a measurement. Criterion is delivery falling >3 points below that
+configuration's own low-rate baseline, since baseline is ~95%, not 100%, from ESP-NOW
+loss.
+
+| set | frame | knee | UART at knee | limited by | -10% | per link (RR) |
+|---|---|---|---|---|---|---|
+| 30 SC | 82 B | ~750 Hz | ~65% | per-frame cost | **675** | **127 Hz** |
+| 166 SC | 354 B | ~270 Hz | ~97% | bandwidth | 243 | ~57 Hz |
+
+**These are two different bottlenecks and it matters.** 166 SC saturates the wire
+exactly where 354 B a frame says it should. 30 SC gives up at *two-thirds* of the
+link, so bytes are not what stops it -- per-frame overhead is (mutex, per-byte ROM
+writes, ESP-NOW send rate). Predicting the 30 SC ceiling from a byte count will
+overestimate it by ~50%.
+
+Corruption was **zero everywhere**, in both sets, right through saturation. Past the
+knee the boards send valid frames and simply send fewer. The old "corrupt lines"
+failure mode is gone with `ets_printf`; what remains is honest under-delivery.
+
+Note the 30 SC knee is soft and moves run to run: 800 Hz passed one sweep at 95.1%
+and failed two others at 88-93%. 750 passed everywhere, hence 675 rather than 720.
+
+### Per-link rate is an average across a burst and a blind gap
+
+The single most misleading number in this project. Measured on a real 20 s capture at
+50 ms dwell:
+
+| | |
+|---|---|
+| median gap between packets on a link | **2.25 ms** |
+| p99 gap | **165 ms** |
+| duty cycle | **16%** |
+
+A link is sampled densely while its transmitter holds the token and then not at all
+for the rest of the cycle. "127 Hz per link" is a rate averaged over both states; no
+link is ever sampled at 127 Hz. At 30 fps video that gap is ~5 consecutive frames with
+no fresh CSI on that link, which is where the datasets' 32%-fresh mask comes from.
+
+**Raising the ping rate does not touch this.** It makes bursts denser and leaves the
+gap exactly as it was. The lever for temporal coverage is the host's
+`--round-duration`.
+
+### A 10 ms poll was costing 5 ms of every dwell
+
+Sweeping dwell at first said shorter was worse below ~12.5 ms: the p99 gap bottomed
+out and then climbed again, and yield fell off a cliff (36% at 5 ms). Backing out the
+loss per handoff gave ~5 ms, constant across dwells -- a suspiciously round number for
+something that ought to be physics.
+
+It was not physics. `uart_command_task` polls a non-blocking stdin and slept
+`pdMS_TO_TICKS(10)` between looks, so a role change waited on average 5 ms just to be
+*read*. The tick is already 1 kHz, so that delay was ten ticks for no reason. One
+line, 10 ms -> 1 ms:
+
+| dwell | p99 gap before | after | per-link rate before | after |
+|---|---|---|---|---|
+| 12.5 ms | 82 ms | **63 ms** | 103 Hz | 117 Hz |
+| 8 ms | 93 ms | 66 ms | 84 Hz | 108 Hz |
+| 5 ms | 148 ms | 68 ms | 61 Hz | 99 Hz |
+
+Short dwells stopped collapsing, and 5 ms went from unusable to merely pointless.
+
+### Dwell: 12.5 ms, and shorter stops helping
+
+`--round-duration` now defaults to 0.0125 in both `capture.py` and `viewer.py`.
+Measured on real 20 s captures, before and after everything above:
+
+| | rate | median gap | p99 gap | duty |
+|---|---|---|---|---|
+| 400 Hz, 50 ms dwell | 92.3 Hz | 1.86 ms | 165.8 ms | 12.0% |
+| **675 Hz, 12.5 ms dwell** | **118.4 Hz** | 1.39 ms | **71.4 ms** | 10.7% |
+
+The blind gap more than halved while the rate went up. Below 12.5 ms the gap stops
+improving and rate falls, so that is the floor -- with the handoff cost fixed, the
+remaining limit is that a link cannot be revisited faster than the token can go round.
+
+Duty cycle barely moved (12.0% -> 10.7%), and that is expected rather than
+disappointing: duty is roughly dwell/cycle, which shortening dwell does not change.
+What changed is how *often* a link is visited, which is the part that matters for
+aligning CSI to 30 fps video.
+
+### Still open
+
+- The dataset builders (`build_activity.py`, `build_pose.py`) do **not** read the new
+  `tx|rx|iq` array. They consume `a` and will silently use magnitude only.
+- Clipping cannot occur in v2 (nothing is scaled into a uint8), so the clip counter is
+  absent by construction rather than always zero.
+- Rates were measured with boards on a desk. Nothing about the UART depends on
+  geometry, but delivery percentage will change once they are spread out.

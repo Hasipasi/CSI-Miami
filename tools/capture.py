@@ -366,8 +366,12 @@ def give(path, own):
 
 
 MAGIC = b'\xa5\x5a'
-FRAME_HDR = 18          # magic..first_word_invalid, see the firmware for the layout
 FRAME_TAIL = 2          # sum16
+# (header bytes, bytes per subcarrier) by frame version. v1 is uint8 amplitude, v2 is
+# raw int8 I/Q with the AGC gain in the two header bytes v1 spends on a clip counter.
+# Both are parsed here rather than behind a mode flag: the 450 recorded takes are v1
+# and must stay readable with the same code that reads whatever we record next.
+FRAME_FMT = {1: (18, 1), 2: (20, 2)}
 
 
 class CsiStream:
@@ -382,6 +386,11 @@ class CsiStream:
 
     feed() returns (csi_records, text_lines). It never raises on malformed input:
     a parser for untrusted bytes that can throw takes its reader thread with it.
+
+    A record is (tx_mac, board_us, rssi, amplitude, clipped, iq). `iq` is None for
+    version 1 frames and a complex64 array for version 2; `amplitude` is filled in
+    either way -- computed from I/Q when that is what arrived -- so every consumer
+    that only wants magnitude works unchanged against both encodings.
     """
 
     def __init__(self):
@@ -410,25 +419,43 @@ class CsiStream:
                     lines += [ln for ln in head[:nl].split(b'\n') if ln]
                 del self.buf[:i]
                 continue
-            if len(self.buf) < FRAME_HDR:
+            if len(self.buf) < 4:       # version and n_sub decide the frame's length
                 return recs, lines
+            fmt = FRAME_FMT.get(self.buf[2])
             n_sub = self.buf[3]
-            total = FRAME_HDR + n_sub + FRAME_TAIL
+            if fmt is None or n_sub < 1:
+                self.bad += 1
+                del self.buf[:1]
+                continue
+            hdr, bps = fmt
+            end = hdr + bps * n_sub
+            total = end + FRAME_TAIL
             if len(self.buf) < total:
                 return recs, lines
             frame = bytes(self.buf[:total])
-            got = frame[FRAME_HDR + n_sub] | (frame[FRAME_HDR + n_sub + 1] << 8)
-            want = sum(frame[2:FRAME_HDR + n_sub]) & 0xffff
-            if frame[2] != 1 or n_sub < 1 or got != want:
+            got = frame[end] | (frame[end + 1] << 8)
+            want = sum(frame[2:end]) & 0xffff
+            if got != want:
                 self.bad += 1
                 del self.buf[:1]        # resync past this magic, not past the payload
                 continue
             mac = ':'.join(f'{b:02x}' for b in frame[4:10])
             rssi = int.from_bytes(frame[10:11], 'little', signed=True)
             lts = int.from_bytes(frame[12:16], 'little')
-            amp = np.frombuffer(frame, dtype=np.uint8, count=n_sub,
-                                offset=FRAME_HDR).astype(np.float32)
-            recs.append((mac, lts, rssi, amp, frame[16]))
+            if bps == 1:
+                amp = np.frombuffer(frame, dtype=np.uint8, count=n_sub,
+                                    offset=hdr).astype(np.float32)
+                recs.append((mac, lts, rssi, amp, frame[16], None))
+            else:
+                # The board sends I/Q uncompensated and passes the AGC factor here as
+                # Q8.8, because scaling on-board would round back into int8 and lose
+                # the low bits phase depends on. Applying it host-side is free.
+                gain = (frame[16] | (frame[17] << 8)) / 256.0
+                pay = np.frombuffer(frame, dtype=np.int8, count=2 * n_sub, offset=hdr)
+                iq = (pay[1::2].astype(np.float32)             # real
+                      + 1j * pay[0::2].astype(np.float32))     # imag
+                iq = (iq * gain).astype(np.complex64)
+                recs.append((mac, lts, rssi, np.abs(iq), 0, iq))
             del self.buf[:total]
 
 
@@ -495,10 +522,13 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
     Kept module-level and shared so the live viewer and the headless recorder cannot
     drift into two different on-disk formats.
 
-      recs   {rx_mac: [(host_time, tx_mac, board_us, rssi, amplitudes), ...]}
+      recs   {rx_mac: [(host_time, tx_mac, board_us, rssi, amplitudes, iq), ...]}
       frames [(index, driver_sequence, wall_time), ...]
 
-    `tx|rx|t` and `tx|rx|a` stay byte-compatible with capture_wizard.py.
+    `tx|rx|t` and `tx|rx|a` stay byte-compatible with capture_wizard.py. When the
+    boards are sending I/Q (frame version 2) an extra complex64 `tx|rx|iq` is written
+    alongside; `a` remains its magnitude, so a reader that only knows about amplitude
+    sees exactly what it saw before and phase is additive rather than a new format.
     """
     out, report = {}, []
     ft = np.array([f[2] for f in frames], dtype=np.float64) - t0
@@ -509,15 +539,15 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
 
     for rx, items in recs.items():
         by_tx = {}
-        for t, tx, lts, rssi, amp in items:
-            by_tx.setdefault(tx, []).append((t, lts, rssi, amp))
+        for t, tx, lts, rssi, amp, iq in items:
+            by_tx.setdefault(tx, []).append((t, lts, rssi, amp, iq))
         for tx, seq in by_tx.items():
             if len(seq) < 5:
                 continue
             # Truncated UART lines show up as a minority subcarrier count; keep
             # the modal width so the stack is rectangular.
             lens = {}
-            for _t, _l, _r, x in seq:
+            for _t, _l, _r, x, _q in seq:
                 lens[len(x)] = lens.get(len(x), 0) + 1
             n = max(lens, key=lens.get)
             seq = [s for s in seq if len(s[3]) == n]
@@ -525,6 +555,8 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
             k = f'{tx}|{rx}'
             out[f'{k}|t'] = t.astype(np.float32)
             out[f'{k}|a'] = np.stack([s[3] for s in seq])
+            if all(s[4] is not None for s in seq):
+                out[f'{k}|iq'] = np.stack([s[4] for s in seq]).astype(np.complex64)
             out[f'{k}|rssi'] = np.array([s[2] for s in seq], dtype=np.int16)
             out[f'{k}|lts'] = unwrap_us([s[1] for s in seq]) / 1e6
             worst = None
@@ -617,9 +649,9 @@ class Recorder:
             if not self.collecting:
                 continue
             now = time.time()
-            for mac, lts, rssi, amp, clipped in recs:
+            for mac, lts, rssi, amp, clipped, iq in recs:
                 self.clipped += clipped
-                self.recs[rx].append((now, mac, lts, rssi, amp))
+                self.recs[rx].append((now, mac, lts, rssi, amp, iq))
         self.read_errors += st.bad
 
     def radio(self):
@@ -795,7 +827,12 @@ def main():
     ap.add_argument('--mode', choices=['roundrobin', 'fixedtx'], default='roundrobin')
     ap.add_argument('--tx', default=None,
                     help='with --mode fixedtx, which board transmits (A/B/C/D)')
-    ap.add_argument('--round-duration', type=float, default=0.05)
+    ap.add_argument('--round-duration', type=float, default=0.025,
+                    help='seconds each board holds the transmit token. This sets the '
+                         'blind gap between a link\'s bursts, not its average rate. '
+                         'The optimum depends on frame size: 25 ms with 166 '
+                         'subcarriers (354 B = 3.84 ms of UART each, so a shorter '
+                         'dwell fits too few frames), 12.5 ms with 30. Measured.')
     ap.add_argument('--warmup', type=float, default=3.0)
     ap.add_argument('--encoders', type=int, default=3)
     ap.add_argument('--queue', type=int, default=120)
