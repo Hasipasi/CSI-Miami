@@ -1,0 +1,27 @@
+# Recordings and built datasets: large, regenerable, not source.
+/data/
+/dataset/
+/archive/
+**/*_frames/
+
+# Pose model weights (~113 MB, re-downloaded by ultralytics on demand)
+yolo11x-pose.pt
+
+# CUDA venv for the pose model
+/.venv_pose/
+
+# ESP-IDF build output. sdkconfig is generated from sdkconfig.defaults, which IS
+# tracked and pins the target; a committed sdkconfig would shadow it.
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# Components come from the registry, so managed_components/ is build output too:
+# 41 prebuilt .a files for 7 chips x 10 IDF versions, of which we use one.
+# dependencies.lock IS tracked -- it pins exact versions and content hashes, and
+# `idf.py build` restores the components from it. Verified: a tree with the lock
+# but neither managed_components/ nor sdkconfig builds a valid esp32s3 image.
+firmware/managed_components/
+
+__pycache__/
+*.pyc

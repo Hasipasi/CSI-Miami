@@ -1,0 +1,40 @@
+# Capture protocol — yahya, test split.
+#
+# Pick it with the "Protocol…" button in the viewer, or:
+#   python3 live_viewer.py --protocol protocols/yahya_test.yaml
+#
+# Timing applies to every take:
+#   lead_in   seconds of "get ready" before recording starts
+#   duration  seconds actually recorded
+#   gap       seconds of rest after recording, before the next take's lead-in
+#
+# Takes are written to data/yahya_test/<take name>.npz plus a matching _frames/
+# directory, so one session's files stay together.
+#
+# The set is cycled, not each take repeated back to back: you get salute0,
+# 2handwave0 ... then salute1, 2handwave1 ... so repeats of one activity land
+# minutes apart rather than seconds, which makes them far more independent samples.
+# 5 rounds x 5 activities = 25 takes, about 4 min.
+
+lead_in: 3
+duration: 5
+gap: 1
+
+repeats: 5
+
+takes:
+  - name: salute
+    instruction: SALUTE — right hand to your forehead, hold
+
+  - name: 2handwave
+    instruction: WAVE — both arms up and down, like a cheerleader
+
+  - name: squat
+    instruction: SQUAT — bend knees, hips back, up and down
+
+  - name: stretch-horizontal
+    instruction: STRETCH HORIZONTAL — both arms straight out sideways
+
+  - name: stretch-vertical
+    instruction: STRETCH VERTICAL — both arms straight up overhead
+

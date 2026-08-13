@@ -1,0 +1,43 @@
+# Capture protocol: a list of takes run back to back, each recorded to its own file.
+#
+#   python3 live_viewer.py --tx C --protocol protocols/poses.yaml
+#
+# or pick it with the "Protocol…" button in the viewer.
+#
+# Timing applies to every take:
+#   lead_in   seconds of "get ready" before recording starts
+#   duration  seconds actually recorded
+#   gap       seconds of rest after recording, before the next take's lead-in
+#
+# Takes are written to data/<this file's name>/<take name>.npz plus a matching
+# _frames/ directory, so one session's files stay together. Names must be unique
+# within the file; duplicates are rejected before the run starts.
+
+lead_in: 5
+duration: 5
+gap: 1
+
+takes:
+  - name: empty
+    instruction: LEAVE THE ROOM — empty-room reference
+
+  - name: neutral
+    instruction: STAND STILL, arms down at your sides
+
+  - name: tpose
+    instruction: T-POSE — both arms straight out sideways
+
+  - name: up
+    instruction: BOTH ARMS STRAIGHT UP
+
+  - name: split
+    instruction: RIGHT ARM FORWARD, LEFT ARM BACK
+
+  - name: crouch
+    instruction: CROUCH / SQUAT and hold
+
+  - name: turned
+    instruction: TURN 90 DEGREES, arms down
+
+  - name: move
+    instruction: MOVE — arms out and down, turn around, squat and stand

@@ -1,0 +1,26 @@
+services:
+  csi:
+    build: .
+    image: csi-rig:latest
+    # The whole repo at one mount point. The previous layout had three overlapping
+    # mounts and tools that guessed which one they were under; one root removes the
+    # guessing and makes every in-container path predictable.
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      # Full /dev, not per-device entries: any current or future ttyACMx / videoN
+      # node is then visible without editing this file or restarting for a replug.
+      - /dev:/dev
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    device_cgroup_rules:
+      # The bind mount above makes device nodes visible, not usable. These grant the
+      # classes we need: USB-serial (166) for the boards, video4linux (81) plus the
+      # media-controller nodes (234) for the RealSense. 234 is a dynamic major -- if
+      # the camera stops being found after a kernel change, check `ls -l /dev/media0`.
+      - 'c 166:* rmw'
+      - 'c 81:* rmw'
+      - 'c 234:* rmw'
+    environment:
+      - DISPLAY=${DISPLAY}
+    stdin_open: true
+    tty: true

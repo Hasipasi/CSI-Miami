@@ -1,0 +1,46 @@
+# Capture protocol — balazs, train split, SINGLE TRANSMITTER (B).
+#
+# Pin B in the viewer's Transmitter bar before running. Only B->A, B->C
+# and B->D exist in this configuration; the other 9 links are not idle,
+# they do not exist, so these recordings are 3-link and NOT interchangeable
+# with the 12-link round-robin corpus. Each link runs ~105 Hz instead of
+# ~26 Hz, because every ping now serves 3 links rather than 12.
+#
+# Pick it with the "Protocol…" button in the viewer, or:
+#   python3 live_viewer.py --protocol protocols/balazs_train_txB.yaml
+#
+# Timing applies to every take:
+#   lead_in   seconds of "get ready" before recording starts
+#   duration  seconds actually recorded
+#   gap       seconds of rest after recording, before the next take's lead-in
+#
+# Takes are written to data/balazs_train_txB/<take name>.npz plus a matching _frames/
+# directory, so one session's files stay together.
+#
+# The set is cycled, not each take repeated back to back: you get salute0,
+# 2handwave0 ... then salute1, 2handwave1 ... so repeats of one activity land
+# minutes apart rather than seconds, which makes them far more independent samples.
+# 10 rounds x 5 activities = 50 takes, about 8 min.
+
+lead_in: 3
+duration: 5
+gap: 1
+
+repeats: 10
+
+takes:
+  - name: salute
+    instruction: SALUTE — right hand to your forehead, hold
+
+  - name: 2handwave
+    instruction: WAVE — both arms up and down, like a cheerleader
+
+  - name: squat
+    instruction: SQUAT — bend knees, hips back, up and down
+
+  - name: stretch-horizontal
+    instruction: STRETCH HORIZONTAL — both arms straight out sideways
+
+  - name: stretch-vertical
+    instruction: STRETCH VERTICAL — both arms straight up overhead
+
