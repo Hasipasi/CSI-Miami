@@ -536,3 +536,162 @@ aligning CSI to 30 fps video.
   absent by construction rather than always zero.
 - Rates were measured with boards on a desk. Nothing about the UART depends on
   geometry, but delivery percentage will change once they are spread out.
+
+## 2026-08-18 — macOS port, the channel was never measured, and the field layout was wrong
+
+Session on gergo's Mac with only boards A and D attached. Three findings that
+change how the rig should be read, each measured on live hardware.
+
+**The rig runs natively on macOS; the container cannot.** Docker Desktop runs
+containers in a Linux VM, so `-v /dev:/dev` exposes the VM's empty `/dev` — no USB
+passthrough exists, verified with `--privileged`. The tools now run from a repo-local
+`.venv_mac` instead. `capture.py` grew a `MacCamera` backend (AVFoundation via
+OpenCV) behind the same interface as the V4L2 `Camera`; `--device` takes a node
+path (Linux), an index, or a camera *name* on macOS. Names matter: OpenCV's index
+order is the *reverse* of AVFoundation's list order on this machine, and index 0 was
+silently the iPhone Continuity Camera, not the built-in one. Cameras are matched by
+fingerprint (their largest-area mode) instead of by position. Two honest losses on
+this backend, both recorded in metadata: no driver timestamps (`monotonic=False`,
+grab-loop jitter ~1 frame) and no driver sequence numbers (OS-dropped frames are
+invisible — do not quote frame-drop figures from macOS sessions).
+
+**Transport re-verified from scratch, 2 boards.** Zero corrupt frames at every rate
+tried (100–400 Hz at SUB 166, 243–900 Hz at SUB 30), delivery 90–96% below the
+knee, knee at ~260 Hz / ~99% UART for 166 — the Linux numbers reproduce on a Mac
+to within a few percent. Round-robin handoff costs nothing measurable: 221–226 Hz
+total at every dwell from 25–200 ms against 220 Hz pinned, median gap 4.13 ms =
+one ping period. The transport is not why any recording was weak.
+
+**The documented "three 64-wide fields" is wrong; the data says two.** Live capture
+of all 192 subcarriers: blocks 64–127 and 128–191 have the same mean amplitude
+within 3% (43.1 vs 44.3) while 0–63 sits 4.8× lower (9.2). 64–191 is one 128-wide
+HT-LTF whose centre null is the dead band at 123–133; the only gain step is at 64.
+Worse, the viewer z-scored per 64 rows *of the compacted frame*, where the real
+boundary lands at row 52 — so two of its three blocks straddled a 5× gain step and
+the banding buried the channel shape (this is the "display looks unordered/noisy"
+complaint; display-only, recordings were always raw). The viewer now *derives* the
+field split from a running mean (`derive_fields` in capture.py) instead of trusting
+any table, and draws each field as its own sub-plot per link (the seam is the
+boundary; heights proportional to subcarrier count; waterfalls default to jet,
+`--cmap diverge` restores the dark-midpoint map). Threshold is 3× because a real
+multipath fade held a 2× step across a whole window and produced a phantom
+boundary at row 106 before the margin was raised. Subcarrier rows are in ascending
+frequency order throughout — adjacent-subcarrier correlation median 0.78 with no
+wrap discontinuity — but not evenly spaced once compacted: row 51→52 jumps
+subcarrier 58→66, row 108→109 jumps 122→134.
+
+**`CONFIG_LESS_INTERFERENCE_CHANNEL 11` was a hope, not a measurement.** The
+firmware now has `SCAN [ms]` (parks the radio, counts promiscuous traffic per
+channel 1–13 at HT20 — a ranking of 802.11 airtime, blind to non-WiFi noise),
+`CHAN <n>` (moves the rig live; at HT40 the secondary goes below a primary ≥5,
+above otherwise, and the ESP-NOW peer channel is updated with it), and `BW <20|40>`
+(runtime bandwidth switch; channel must be re-applied *before* the peer rate config
+or the boards keep transmitting HT20 while claiming HT40 — found the hard way, RX
+kept reporting 128 subcarriers). Survey of this room: classic 1/6/11 congestion
+with a −25 dBm emitter on ch6; every HT40 placement overlaps it (all 13 primaries
+within 11.9–16.8 KB of contending airtime per 6.5 s survey), so at 40 MHz there is
+nothing to dodge. At 20 MHz there is: **HT20 on ch3 delivered 242.3/243 Hz =
+99.7%, against 91–95% for HT40 on ch11.** Even HT40 improves on ch3 (98.2%).
+HT20 costs half the span: 128 subcarriers (64 LLTF + 64 HT-LTF, boundary at ~64)
+instead of 166/192. Whether 3-dB-quieter narrowband beats 2× frequency diversity
+for recognition is an open question the BW button in the viewer exists to answer —
+a recording's own frames say which was active via n_sub.
+
+Viewer additions: STOP/START CSI (parks every board via `RX 000000000000`, the
+firmware's own match-nothing filter; refuses mid-take), FIND BEST CHANNEL (scans
+all boards, pools bytes and worst RSSI per channel, scores HT40 *spans* not
+primaries, moves the rig if a better block exists), BW toggle, field-boundary
+markers, and link counts that follow however many boards are attached. Recordings
+this session go to `/Volumes/GergoDisk/csi-data` (exFAT stick, 147 MB/s).
+
+**The boot channel is now 13** (`CONFIG_LESS_INTERFERENCE_CHANNEL`), not the
+inherited 11: four hand-run surveys picked ch13 unanimously (11–18% less contending
+airtime than ch11), and delivery measured after the reflash confirms it — pinned
+A→D at 243 Hz/SUB 166 lost 5.8% on ch13 against 10–15% on ch11 the same day. That
+is back inside the 4–9% ESP-NOW no-ACK baseline; the remaining loss is occupied
+air, which no 40 MHz placement escapes in this room.
+
+Boards A and D are running this firmware (built in the stock `espressif/idf:release-v5.5`
+image — the repo's own Dockerfile currently fails at the pip layer and needs fixing).
+**B and C still run the previous build: old boot channel 11, no SCAN/CHAN/BW. Flash
+them before the next full-rig session or they will sit deaf on a different channel
+and look like dead serial links.**
+
+## 2026-08-18 (later) — the firmware audit, and loss drops 3× at every operating point
+
+A five-finding hostile audit (fifteen agents, every finding confirmed by two
+independent skeptics, one of whom disassembled `libesp_csi_gain_ctrl.a` to check the
+gain-path claim) found that the transport's own architecture was masquerading as
+radio loss. All fixes are in and measured, boards A and D flashed.
+
+**The root defect: every CSI frame was shifted into the UART FIFO byte-by-byte from
+inside `wifi_csi_rx_cb` — which runs in the WiFi task.** 3.84 ms of busy-wait per
+166-SC frame, ~93% of the radio task's time at 243 Hz. That single mechanism *was*
+the measured 166-SC knee (354 B = 3.84 ms = 260 Hz exactly), most of the per-frame
+cost capping 30 SC at ~750 Hz, the 10% operating derate, and a slice of what was
+booked as "ESP-NOW baseline loss". ESP_LOG additionally bypassed `print_mux` from
+the other core (mid-frame interleave — the old ~23%-of-markers bug, still half-open),
+and console RX was the bare 128 B hardware FIFO, which is how a SCAN used to eat
+role commands ("dead board" incidents).
+
+**The fix**: `uart_driver_install` (24 KB interrupt-driven TX ring, 2 KB RX ring),
+everything — frames, markers, acks, and via `uart_vfs_dev_use_driver` the logs too —
+enqueued through one atomic path; a full ring drops whole frames and counts them
+(`STATS,framedrops,…`), so the wire saturates visibly instead of stalling the radio.
+The 30 s task-WDT override in sdkconfig.defaults (which papered over the busy-wait)
+is removed. Measured, same channel, same afternoon:
+
+| point | loss before | loss after |
+|---|---|---|
+| 166 SC @ 243 Hz | 2.66% | **0.84%** |
+| 30 SC @ 675 Hz | 7.85% | **2.49%** |
+| 30 SC @ 900 Hz | 5.33% | **2.99%** |
+| 30 SC @ 1300 Hz | collapsed at 86.6% | delivers 1072.8 Hz — the v3 wire limit (1071.6) to 0.1% |
+
+Per-frame cost is gone: the UART's byte rate is now the only ceiling, and the
+loss cliff above the knee is replaced by counted, attributable drops.
+
+**Frame version 3** (24 B header): raw `(agc_gain, fft_gain)` pair at bytes 18-19
+beside the Q8.8 factor, and Q8.8 = 0 reserved as an explicit "AGC not calibrated"
+sentinel. v2 shipped gain=1.0× for the first ~100 frames of every session — the
+component returns INVALID_STATE until its baseline latches and the return was
+ignored — so the start of every recording, where reference windows live, carried
+uncalibrated AGC presented as calibrated. The AGC baseline also now restarts on
+every CHAN/BW retune (it was boot-time-stale before). Host parses v1/v2/v3.
+
+**SUB 114** (new table): the audit confirmed what the band plot showed — 52 of the
+"166 live" subcarriers are the legacy LLTF at ~5× lower gain (~2.9° int8 phase
+quantisation noise vs ~0.6° in the HT-LTF), duplicating spectrum the HT-LTF already
+covers. 114 = every HT-LTF subcarrier: full frequency resolution, 254 B frame,
+362 Hz wire limit; measured 321 Hz delivered at 330. Boot default stays 166 @ 243
+until 114's derate point is swept properly.
+
+**Ping send failures** are a counter in STATS now, not an ESP_LOGW from the esp_timer
+task (which blocked ~0.76 ms per failure, jittering the surviving pings).
+
+Deferred from the audit: unicast-with-retries (would repair most collision loss;
+needs the ping seq carried in the frame first, and the current `payload+15` read is
+mid-MAC-header garbage — probe the real ESP-NOW body offset empirically before
+trusting any seq), and a higher console baud (2-3 Mbaud would raise every wire
+ceiling ~2-3×, gated on what the CH343 bridge sustains).
+
+## 2026-08-18 (later still) — forcing the AGC makes amplitude jitter WORSE, not better
+
+The ~12% per-packet common-mode amplitude wobble is not the receiver's AGC failing
+to be compensated — pinning the gain proves it. `AGC LOCK` / `AGC FREE` commands
+were added (the gain-ctrl component's `set_rx_force_gain`, reversible with (0,0)),
+and measured twice on the pinned A→D link with the test order reversed between
+runs: locked showed 19.9% and 34.2% common-mode against auto's 5.5% and 16.4% in
+the same minutes — locked is 2–3× worse in both orders, zero saturated samples
+either way.
+
+Reading: the AGC is *tracking* a real per-packet level variation (TX-side power
+jitter being the prime suspect — no RX setting can remove that) and the Q8.8
+compensation restores it accurately; a pinned gain forfeits the tracking and adds
+quantisation noise on packets that land low in the ADC. The esp-csi guidance to
+force gain for amplitude stability fails on this rig. Consequence: keep AGC auto;
+treat the common-mode as the informationless nuisance it is — per-packet level
+normalisation in preprocessing (and the viewer's Level-lock for display). The
+commands stay in the firmware for re-testing elsewhere; the GUI button was removed
+so the everyday path cannot degrade a recording by accident. The host now counts
+saturated int8 samples per packet (v2/v3 parse) as the clipping telltale either way.

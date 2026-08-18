@@ -25,3 +25,7 @@ firmware/managed_components/
 
 __pycache__/
 *.pyc
+
+# Native macOS venv for running the viewer off the rig PC (see MacCamera in
+# tools/capture.py). Linux uses the container instead.
+/.venv_mac/

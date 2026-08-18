@@ -303,8 +303,10 @@ change; the table in `NOTES.md` records what each combination gave.
 `dependencies.lock` is tracked and `managed_components/` is not — `idf.py build`
 restores the components from the lock, which also pins their content hashes.
 
-Boards accept `TX`, `RX <mac>`, `RATE <hz>`, `IDENT`, `IDENT OFF`, `LED r,g,b` on the
-serial line and reply with `ROLE_TX` / `ROLE_RX,<mac>` / `RATE_OK,<hz>`. CSI arrives
+Boards accept `TX`, `RX <mac>`, `RATE <hz>`, `SUB <n>`, `CHAN <n>`, `BW <20|40>`,
+`SCAN [ms]`, `IDENT`, `IDENT OFF`, `LED r,g,b` on the serial line and reply with
+`ROLE_TX` / `ROLE_RX,<mac>` / `RATE_OK,<hz>` / `CHAN_OK,<ch>,<bw>` / `BW_OK,<bw>,<ch>`
+/ `SCAN_CH,...` lines. `CHAN` and `BW` must be issued to every board together. CSI arrives
 as binary frames interleaved with those text lines on the same UART:
 
 ```
@@ -321,6 +323,13 @@ as binary frames interleaved with those text lines on the same UART:
                               20 2ns (imag, real) int8 pairs
  +2 sum16 over [2, end)        +2 sum16 over [2, end)
 ```
+
+Version 3 (current) widens the header to 24 B: the raw `(agc_gain, fft_gain)` pair
+travels at bytes 18-19 beside the Q8.8 factor at 16-17, `first_word_invalid` moves
+to 20, and Q8.8 = 0 means "AGC not yet calibrated — do not scale" (the first ~100
+frames after boot or a retune). `SUB 114` selects every HT-LTF subcarrier, skipping
+the 52 five-fold-weaker legacy-LLTF duplicates; `STATS` reports on-board drop
+counters that make wire loss distinguishable from radio loss.
 
 I/Q is sent **uncompensated**, with the AGC factor in the header for the host to
 apply — scaling on the board would round back into int8 and cost exactly the low

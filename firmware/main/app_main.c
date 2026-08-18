@@ -23,6 +23,28 @@
      RX <mac_hex>        -- this board becomes/stays a receiver, filtering CSI
                             for the given MAC (the current token holder), LED red.
    <mac_hex> is 12 hex chars, no separators, e.g. ecda3b4cb8d0.
+
+   Also:
+     RATE <hz>          -- retune the ping rate live.
+     SUB <n>            -- 0 (all 192), 30, 114 (every HT-LTF subcarrier: full
+                            frequency resolution without the 5x-weaker legacy LLTF
+                            duplicates) or 166 subcarriers per frame.
+     AGC LOCK / FREE    -- pin the receive gain to the latched baseline (kills the
+                            ~12% per-packet amplitude wobble; risks clipping if the
+                            scene gets much louder) / return to automatic gain.
+                            Retunes auto-FREE. Needs 100 frames of baseline first.
+     STATS              -- STATS,framedrops,textdrops,sendfail,heap. framedrops is
+                            whole records dropped because the UART TX ring was full,
+                            i.e. wire loss, distinguishable from radio loss.
+     CHAN <n>           -- move to 2.4 GHz channel n (1-13). Every board must be
+                            moved together, and at HT40 the pair n and its secondary
+                            are what is occupied.
+     BW <20|40>         -- radio bandwidth in MHz. 40 gives more subcarriers, 20
+                            gives a span narrow enough to dodge a busy band. Move
+                            every board together.
+     SCAN [ms]          -- survey channels 1-13 for `ms` each (default 250) and
+                            report SCAN_CH,<ch>,<pkts>,<bytes>,<rssi_mean>,<rssi_max>
+                            per channel, then SCAN_DONE,<channel restored>.
 */
 
 #include <stdio.h>
@@ -35,7 +57,9 @@
 
 #include "esp_mac.h"
 #include "rom/ets_sys.h"
-#include "esp_rom_uart.h"   // esp_rom_uart_tx_one_char: same FIFO path as ets_printf
+#include <stdarg.h>
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -49,7 +73,15 @@
 
 #define STATUS_LED_GPIO 48
 
-#define CONFIG_LESS_INTERFERENCE_CHANNEL   11
+// 13, not the 11 this shipped with: 11 was inherited from Espressif's example and
+// never checked. Surveyed 2026-08-18 (SCAN, both boards pooled, three runs): ch13's
+// HT40 span carried 11-18% less contending airtime than ch11's, and the ranking was
+// identical every run. At HT40 no placement clears the band entirely -- a -30 dBm AP
+// overlaps every span -- so this is the least-bad 40 MHz block, not a quiet one.
+// HT20 on a genuinely quiet channel measured 0.3% loss against 5-15% here; that
+// remains a runtime experiment via "BW 20" + "CHAN <n>" until the dataset builders
+// handle 128-wide frames.
+#define CONFIG_LESS_INTERFERENCE_CHANNEL   13
 #define CONFIG_WIFI_BANDWIDTH               WIFI_BW_HT40
 #define CONFIG_ESP_NOW_PHYMODE              WIFI_PHY_MODE_HT40
 #define CONFIG_ESP_NOW_RATE                 WIFI_PHY_RATE_MCS0_LGI
@@ -110,8 +142,19 @@
 #define CONFIG_IQ_MODE                        1
 
 #if CONFIG_IQ_MODE
-#define CSI_FRAME_VERSION                     2
-#define CSI_FRAME_HDR                        20     // 2 extra bytes carry the AGC gain
+// Version 3 header (24 B): adds the raw (agc_gain, fft_gain) pair beside the Q8.8
+// compensation factor, and reserves 0 in the Q8.8 field as an explicit "AGC not yet
+// calibrated" sentinel. Version 2 shipped gain=1.0x for the first ~100 frames of
+// every boot -- the component returns INVALID_STATE until its baseline latches, the
+// return value was ignored, and the host scaled uncalibrated AGC as if it were truth.
+//
+//   16  2  gain x256 Q8.8, uint16 LE; 0 = not calibrated, do not scale
+//   18  1  raw AGC gain (uint8)   -- host can rebuild any compensation against
+//   19  1  raw FFT gain (int8)       any reference, and detect gain steps
+//   20  1  first_word_invalid
+//   21  3  reserved (0)
+#define CSI_FRAME_VERSION                     3
+#define CSI_FRAME_HDR                        24
 #define CSI_BYTES_PER_SUB                     2
 #else
 #define CSI_FRAME_VERSION                     1
@@ -143,6 +186,21 @@
 // rather than answering it by assumption -- subsetting is reversible in analysis,
 // discarding at the boards is not.
 #define CONFIG_SUB_COUNT                    166
+// HT-LTF only: SUB_INDEX_166 minus the 52 legacy-LLTF entries (original 6-58). The
+// LLTF duplicates spectrum the HT-LTF already covers at ~5x less gain -- int8 phase
+// quantisation noise ~2.9 deg/SC there against ~0.6 deg in the HT-LTF -- so on a
+// bandwidth-bound wire those 104 bytes bought near-noise. 114 is "every subcarrier
+// worth sending": full frequency resolution at a ~360 Hz wire limit instead of 260.
+static const uint8_t SUB_INDEX_114[114] = {
+    66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+    81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95,
+    96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+    111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 134, 135, 136,
+    137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151,
+    152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166,
+    167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181,
+    182, 183, 184, 185, 186, 187, 188, 189, 190,
+};
 static const uint8_t SUB_INDEX_30[30] = {
     66, 70, 74, 78, 82, 85, 89, 93, 97, 101, 105, 109, 113, 117, 121,
     135, 139, 143, 147, 151, 155, 159, 163, 167, 171, 174, 178, 182, 186, 190,
@@ -174,6 +232,9 @@ static const uint8_t *sub_table(int n)
     if (n == 30) {
         return SUB_INDEX_30;
     }
+    if (n == 114) {
+        return SUB_INDEX_114;
+    }
     if (n == 166) {
         return SUB_INDEX_166;
     }
@@ -195,11 +256,64 @@ static volatile bool is_tx = false;
 // role changes stop touching it -- lets a specific board be picked out physically on
 // the bench without pulling it out of the ring or reflashing it.
 static volatile bool ident_mode = false;
-// ets_printf is not atomic across tasks: CSI lines are printed from the WiFi task
-// while role markers are printed from the UART command task, and concurrent calls
-// interleave mid-line, corrupting both. That silently ate ~23% of ROLE_TX markers.
-// Every multi-line/multi-call print below must hold this.
-static SemaphoreHandle_t print_mux;
+// All output -- binary frames, role markers, acks -- goes through the UART driver's
+// interrupt-driven TX ring via uart_write_bytes, which is atomic per call: order on
+// the wire is enqueue order, the property the old print_mux existed to provide. The
+// old path was worse than unserialised: every byte was shifted into the FIFO from
+// the emitting task itself, so the WiFi task busy-waited ~3.8 ms per 166-SC frame
+// (the measured rate knee), and ESP_LOG bypassed the mutex entirely, interleaving
+// mid-frame from the other core. Now ESP_LOG rides the same driver (see app_main).
+//
+// A full ring means the wire is saturated: drop whole records and count, never
+// block the radio. STATS reports the counters.
+static volatile uint32_t frame_drops = 0;
+static volatile uint32_t text_drops = 0;
+static volatile uint32_t send_fails = 0;
+
+static void emit(const void *buf, size_t len)
+{
+    size_t room = 0;
+    if (uart_get_tx_buffer_free_size(UART_NUM_0, &room) != ESP_OK || room < len) {
+        frame_drops++;
+        return;
+    }
+    uart_write_bytes(UART_NUM_0, buf, len);
+}
+
+static void emit_textf(const char *fmt, ...)
+{
+    char line[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return;
+    }
+    if (n >= (int)sizeof(line)) {
+        n = (int)sizeof(line) - 1;
+    }
+    size_t room = 0;
+    if (uart_get_tx_buffer_free_size(UART_NUM_0, &room) != ESP_OK || room < (size_t)n) {
+        text_drops++;
+        return;
+    }
+    uart_write_bytes(UART_NUM_0, line, n);
+}
+
+// Frames received since boot or the last retune; also gates the AGC baseline
+// collection (first 100 frames), so a retune restarts calibration -- the old code
+// kept compensating against a stale boot-time RF reference after CHAN/BW moved.
+static volatile int csi_count = 0;
+// The latched AGC baseline, file-scope so "AGC LOCK" can pin the radio to it from
+// the command task. Locking stops the per-packet gain re-selection that puts a
+// measured ~12% common-mode wobble on every amplitude; the cost is dynamic range
+// (a much louder signal than the baseline scene clips at int8), so it is a command,
+// not the default, and the host counts saturated samples to catch it.
+static uint8_t agc_base = 0;
+static int8_t fft_base = 0;
+static volatile bool base_ready = false;
+static volatile bool agc_locked = false;
 static uint8_t tx_filter_mac[6] = {0}; // whichever MAC we should currently accept CSI from
 static led_strip_handle_t led_strip;
 static esp_timer_handle_t ping_timer;
@@ -249,13 +363,9 @@ static void become_tx(void)
     // every dwell silent. At a 50 ms dwell that was 40% of the turn, and it is why
     // each turn yielded ~1.3 of the 2.5 packets it should.
     ping_timer_cb(NULL);
-    // ets_printf, not ESP_LOGI: CSI records are emitted with ets_printf (straight to the
-    // UART FIFO) while ESP_LOGI goes through the VFS/driver buffer. Mixing the two lets
-    // them reorder under buffer pressure, which makes the host misjudge which side of a
-    // role change a record falls on. Same path == guaranteed ordering.
-    xSemaphoreTake(print_mux, portMAX_DELAY);
-    ets_printf("ROLE_TX\n");
-    xSemaphoreGive(print_mux);
+    // Same driver ring as the CSI frames, so a role marker orders exactly with the
+    // records around it -- the host decides which dwell a packet belongs to from this.
+    emit_textf("ROLE_TX\n");
 }
 
 static void become_rx(const uint8_t *peer_mac)
@@ -266,9 +376,7 @@ static void become_rx(const uint8_t *peer_mac)
         set_led(40, 0, 0); // red = receiving
     }
     esp_timer_stop(ping_timer); // ignored if not running
-    xSemaphoreTake(print_mux, portMAX_DELAY);
-    ets_printf("ROLE_RX," MACSTR "\n", MAC2STR(tx_filter_mac)); // ets_printf: see become_tx()
-    xSemaphoreGive(print_mux);
+    emit_textf("ROLE_RX," MACSTR "\n", MAC2STR(tx_filter_mac));
 }
 
 static void ping_timer_cb(void *arg)
@@ -277,7 +385,10 @@ static void ping_timer_cb(void *arg)
     esp_err_t ret = esp_now_send(BROADCAST_MAC, (const uint8_t *)&seq, sizeof(seq));
     seq++;
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "free_heap: %ld <%s> ESP-NOW send error", esp_get_free_heap_size(), esp_err_to_name(ret));
+        // A counter, not a log: this fires from the esp_timer task at the ping rate,
+        // and formatting a log line there blocked ~0.76 ms per failure -- jittering
+        // the very pings that were already failing. STATS reports it.
+        send_fails++;
     }
 }
 
@@ -296,6 +407,160 @@ static bool parse_hex_mac(const char *hex, uint8_t *out)
     return true;
 }
 
+// ------------------------------------------------------------- channel control
+// Which channel the rig runs on was, until now, a compile-time constant inherited
+// from Espressif's example, and CONFIG_LESS_INTERFERENCE_CHANNEL was a hope rather
+// than a measurement. It matters more than the name suggests: at HT40 the secondary
+// sits *below* the primary, so "channel 11" actually occupies 7-11 -- straight
+// across the two most crowded channels in a typical building.
+static volatile uint8_t cur_channel = CONFIG_LESS_INTERFERENCE_CHANNEL;
+// Bandwidth is runtime state, not the compile-time macro it used to be. 40 MHz cannot
+// dodge a congested 2.4 GHz band -- 1/6/11 are 25 MHz apart, so every HT40 placement
+// overlaps at least one -- while 20 MHz can, at the cost of frequency diversity. That
+// is a trade to measure on the rig, and measuring it meant being able to switch
+// without a reflash between every data point.
+static volatile uint8_t cur_bw = (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT40) ? 40 : 20;
+
+static bool apply_channel(uint8_t ch)
+{
+    if (ch < 1 || ch > 13) {
+        return false;
+    }
+    wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+    if (cur_bw == 40) {
+        // HT40 needs its second 20 MHz beside the primary and inside 1-13: below for
+        // a high primary, above for a low one. The *pair* is what the rig occupies,
+        // so it is the pair a survey has to be scored against.
+        sec = (ch >= 5) ? WIFI_SECOND_CHAN_BELOW : WIFI_SECOND_CHAN_ABOVE;
+    }
+    if (esp_wifi_set_channel(ch, sec) != ESP_OK) {
+        return false;
+    }
+    cur_channel = ch;
+    // The RF reference just moved: a gain baseline recorded on the old channel is
+    // stale, so restart the 100-frame collection (no-op at boot when nothing has
+    // been recorded yet).
+    if (csi_count > 0) {
+        // A lock pinned against the old channel's RF is meaningless on the new one,
+        // and re-baselining under forced gain would just measure the forced value.
+        if (agc_locked) {
+            esp_csi_gain_ctrl_set_rx_force_gain(0, 0);
+            agc_locked = false;
+            emit_textf("AGC_OK,FREE,retune\n");
+        }
+        esp_csi_gain_ctrl_reset_rx_gain_baseline();
+        base_ready = false;
+        csi_count = 0;
+    }
+    // The broadcast peer was registered against a fixed channel. Leaving it stale
+    // points esp_now_send at a channel the radio is no longer on, which fails
+    // silently -- pings stop and every link goes quiet with nothing logged.
+    esp_now_peer_info_t peer = {0};
+    if (esp_now_get_peer(BROADCAST_MAC, &peer) == ESP_OK) {
+        peer.channel = ch;
+        esp_now_mod_peer(&peer);
+    }
+    return true;
+}
+
+static bool apply_bandwidth(int mhz)
+{
+    if (mhz != 20 && mhz != 40) {
+        return false;
+    }
+    wifi_bandwidth_t bw = (mhz == 40) ? WIFI_BW_HT40 : WIFI_BW_HT20;
+    if (esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, bw) != ESP_OK) {
+        return false;
+    }
+    cur_bw = (uint8_t)mhz;
+    // Channel first, rate config second. The order matters going *up*: HT40 phymode
+    // needs the secondary channel to exist, and right after set_bandwidth the radio
+    // is still on the HT20 channel with no secondary -- the rate config call then
+    // fails and the board keeps transmitting HT20 frames while claiming HT40, which
+    // is exactly what happened (RX reported 128 subcarriers after BW 40).
+    apply_channel(cur_channel);
+    // ESP-NOW carries its own PHY mode. Left at HT20 while the radio is HT40, every
+    // transmission stays 20 MHz wide and the CSI silently loses half its span.
+    esp_now_rate_config_t rc = {
+        .phymode = (mhz == 40) ? WIFI_PHY_MODE_HT40 : WIFI_PHY_MODE_HT20,
+        .rate    = CONFIG_ESP_NOW_RATE,
+        .ersu    = false,
+        .dcm     = false,
+    };
+    esp_err_t err = esp_now_set_peer_rate_config(BROADCAST_MAC, &rc);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "peer rate config (%d MHz): %s", mhz, esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+// ---- channel survey
+// SCAN parks the radio on each channel and counts what the PHY can hear.
+// Deliberately a received-frame census rather than an energy/CCA reading: the
+// promiscuous callback is the hook the driver actually gives us, and it counts real
+// competing traffic rather than a number that needs calibrating. The limit is that
+// it cannot see non-802.11 energy -- microwaves, BLE, analogue video senders -- so a
+// channel this calls quiet can still be noisy. It is a ranking, not a noise floor.
+static volatile bool scan_mode = false;
+static volatile uint32_t scan_pkts;
+static volatile uint32_t scan_bytes;
+static volatile int32_t  scan_rssi_sum;
+static volatile int32_t  scan_rssi_max;
+
+static void promisc_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    if (!scan_mode) {
+        return;
+    }
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    scan_pkts++;
+    scan_bytes += pkt->rx_ctrl.sig_len;
+    scan_rssi_sum += pkt->rx_ctrl.rssi;
+    if (pkt->rx_ctrl.rssi > scan_rssi_max) {
+        scan_rssi_max = pkt->rx_ctrl.rssi;
+    }
+}
+
+static void do_scan(uint32_t dwell_ms)
+{
+    // Stop being a transmitter for the duration: pinging on channels the rest of the
+    // rig is not listening on is pure interference, and a board that resumed pinging
+    // mid-survey would measure itself.
+    is_tx = false;
+    esp_timer_stop(ping_timer);
+    esp_wifi_set_csi(false);
+    esp_wifi_set_promiscuous_rx_cb(promisc_rx_cb);
+    // HT20 for the survey: a 40 MHz capture smears two channels into one number, and
+    // comparing channels is the entire point.
+    esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, WIFI_BW_HT20);
+
+    emit_textf("SCAN_BEGIN,%u\n", (unsigned)dwell_ms);
+
+    for (int ch = 1; ch <= 13; ch++) {
+        if (esp_wifi_set_channel((uint8_t)ch, WIFI_SECOND_CHAN_NONE) != ESP_OK) {
+            continue;
+        }
+        scan_pkts = 0; scan_bytes = 0; scan_rssi_sum = 0; scan_rssi_max = -128;
+        scan_mode = true;
+        vTaskDelay(pdMS_TO_TICKS(dwell_ms));
+        scan_mode = false;
+        uint32_t n = scan_pkts;
+        int rssi_mean = n ? (int)(scan_rssi_sum / (int32_t)n) : -128;
+        emit_textf("SCAN_CH,%d,%u,%u,%d,%d\n", ch, (unsigned)n,
+                   (unsigned)scan_bytes, rssi_mean, (int)scan_rssi_max);
+    }
+
+    esp_wifi_set_promiscuous_rx_cb(NULL);
+    apply_bandwidth(cur_bw);          // also re-applies the channel
+
+    esp_wifi_set_csi(true);
+    // Left as a receiver of nobody on purpose: a survey takes seconds, the host's
+    // schedule has moved on, and it issues the next TX/RX itself.
+    memset(tx_filter_mac, 0, sizeof(tx_filter_mac));
+    emit_textf("SCAN_DONE,%u\n", (unsigned)cur_channel);
+}
+
 static void uart_command_task(void *arg)
 {
     char line[64];
@@ -306,15 +571,13 @@ static void uart_command_task(void *arg)
             // whatever role it had, and goes silent as a receiver while still
             // transmitting. That is exactly the "dead board" seen twice in these
             // sessions, and it needed a replug because nothing ever cleared the flag.
-            // Overruns get likelier as print pressure rises, since ets_printf blocks
-            // on a full TX FIFO and starves this task.
+            // Far less likely now that RX has a 2 KB driver ring instead of the
+            // bare 128 B hardware FIFO, but kept: an unclearable error latch is
+            // still a dead board.
             clearerr(stdin);
-            // 1 ms, not 10. stdin is non-blocking, so this delay *is* the command
-            // latency, and a role change cannot take effect until this task next
-            // looks. At 10 ms it cost ~5 ms of every dwell on average -- 17% of a
-            // 50 ms dwell and 39% of a 12.5 ms one, which is what made short dwells
-            // lose more than they gained. The tick is already 1 kHz, so 1 ms is one
-            // tick: the shortest wait that still yields the CPU.
+            // With the console on the UART driver, fgets blocks until a full line
+            // arrives, so this branch only fires on EOF/error and the delay is no
+            // longer the command-latency path it was on the driverless console.
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
@@ -351,9 +614,7 @@ static void uart_command_task(void *arg)
                     esp_timer_stop(ping_timer);
                     esp_timer_start_periodic(ping_timer, ping_period_us);
                 }
-                xSemaphoreTake(print_mux, portMAX_DELAY);
-                ets_printf("RATE_OK,%u\n", hz);  // ets_printf: see become_tx()
-                xSemaphoreGive(print_mux);
+                emit_textf("RATE_OK,%u\n", hz);
             } else {
                 ESP_LOGW(TAG, "bad RATE command: '%s'", line);
             }
@@ -363,14 +624,59 @@ static void uart_command_task(void *arg)
             // resizes from the wire rather than being told separately.
             unsigned nsc;
             if (sscanf(line + 4, "%u", &nsc) == 1
-                && (nsc == 0 || nsc == 30 || nsc == 166)) {
+                && (nsc == 0 || nsc == 30 || nsc == 114 || nsc == 166)) {
                 sub_count = (int)nsc;
-                xSemaphoreTake(print_mux, portMAX_DELAY);
-                ets_printf("SUB_OK,%u\n", nsc);  // ets_printf: see become_tx()
-                xSemaphoreGive(print_mux);
+                emit_textf("SUB_OK,%u\n", nsc);
             } else {
                 ESP_LOGW(TAG, "bad SUB command: '%s'", line);
             }
+        } else if (strncmp(line, "BW ", 3) == 0) {
+            // Every board must move together, exactly like CHAN: a board left at the
+            // other bandwidth cannot decode the others at all.
+            unsigned mhz;
+            if (sscanf(line + 3, "%u", &mhz) == 1 && apply_bandwidth((int)mhz)) {
+                emit_textf("BW_OK,%u,%u\n", mhz, (unsigned)cur_channel);
+            } else {
+                ESP_LOGW(TAG, "bad BW command: '%s'", line);
+            }
+        } else if (strncmp(line, "CHAN ", 5) == 0) {
+            // Every board must be moved together: a board left on the old channel
+            // hears nothing and looks like a dead serial link.
+            unsigned ch;
+            if (sscanf(line + 5, "%u", &ch) == 1 && apply_channel((uint8_t)ch)) {
+                emit_textf("CHAN_OK,%u,%u\n", ch, (unsigned)cur_bw);
+            } else {
+                ESP_LOGW(TAG, "bad CHAN command: '%s'", line);
+            }
+        } else if (strncmp(line, "SCAN", 4) == 0) {
+            // Blocks this task for 13 * dwell. That is deliberate: commands arriving
+            // mid-survey would retune the radio underneath it and silently corrupt
+            // the numbers, so they wait in the UART buffer instead.
+            unsigned ms = 250;
+            if (sscanf(line + 4, "%u", &ms) != 1) {
+                ms = 250;                 // bare "SCAN"
+            }
+            if (ms < 20)   { ms = 20; }   // below a beacon interval measures nothing
+            if (ms > 2000) { ms = 2000; } // 13 channels, so this is already 26 s
+            do_scan(ms);
+        } else if (strcmp(line, "AGC LOCK") == 0) {
+            if (base_ready) {
+                esp_csi_gain_ctrl_set_rx_force_gain(agc_base, fft_base);
+                agc_locked = true;
+                emit_textf("AGC_OK,LOCK,%u,%d\n", (unsigned)agc_base, (int)fft_base);
+            } else {
+                // Nothing sensible to pin to yet: the baseline needs 100 received
+                // frames after boot or the last retune.
+                emit_textf("AGC_OK,WAIT\n");
+            }
+        } else if (strcmp(line, "AGC FREE") == 0) {
+            esp_csi_gain_ctrl_set_rx_force_gain(0, 0);
+            agc_locked = false;
+            emit_textf("AGC_OK,FREE\n");
+        } else if (strcmp(line, "STATS") == 0) {
+            emit_textf("STATS,framedrops=%u,textdrops=%u,sendfail=%u,heap=%lu\n",
+                       (unsigned)frame_drops, (unsigned)text_drops,
+                       (unsigned)send_fails, (unsigned long)esp_get_free_heap_size());
         } else if (strcmp(line, "IDENT") == 0) {
             ident_mode = true;
             set_led(40, 20, 0); // orange -- physically identifies this board on the bench
@@ -407,28 +713,25 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     }
 
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
-    static int s_count = 0;
     float compensate_gain = 1.0f;
+    esp_err_t comp_state = ESP_ERR_INVALID_STATE;
     static uint8_t agc_gain = 0;
     static int8_t fft_gain = 0;
 #if CONFIG_GAIN_CONTROL
-    static uint8_t agc_gain_baseline = 0;
-    static int8_t fft_gain_baseline = 0;
     esp_csi_gain_ctrl_get_rx_gain(rx_ctrl, &agc_gain, &fft_gain);
-    if (s_count < 100) {
+    if (csi_count < 100) {
         esp_csi_gain_ctrl_record_rx_gain(agc_gain, fft_gain);
-    } else if (s_count == 100) {
-        esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_gain_baseline, &fft_gain_baseline);
-#if CONFIG_FORCE_GAIN
-        esp_csi_gain_ctrl_set_rx_force_gain(agc_gain_baseline, fft_gain_baseline);
-#endif
+    } else if (csi_count == 100) {
+        esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_base, &fft_base);
+        base_ready = true;
     }
-    esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
+    // The return value matters: INVALID_STATE until the 100-frame baseline latches,
+    // during which compensate_gain keeps its 1.0f init. Ignoring it shipped that
+    // 1.0x as a real factor for the first ~0.4 s of every session.
+    comp_state = esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
 #endif
 
-    uint32_t rx_id = *(uint32_t *)(info->payload + 15);
-    (void)rx_id;
-    if (!s_count) {
+    if (!csi_count) {
         ESP_LOGI(TAG, "========== CSI RECV (binary CSI%d frames) ==========", CSI_FRAME_VERSION);
     }
 
@@ -488,16 +791,27 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 #if CONFIG_IQ_MODE
     // Q8.8 fixed point. Saturating rather than wrapping: a wrapped gain would look
     // like a plausible small number and silently rescale that packet alone.
-    int gain_q8 = (int)(compensate_gain * 256.0f + 0.5f);
-    if (gain_q8 < 0) {
-        gain_q8 = 0;
-    } else if (gain_q8 > 65535) {
-        gain_q8 = 65535;
+    // 0 is reserved as the "not calibrated" sentinel (see comp_state above), so a
+    // valid factor is clamped to [1, 65535]. The raw pair travels beside it: from
+    // (agc, fft) the host can rebuild compensation against any reference, compare
+    // absolute amplitude across sessions, and segment phase at gain steps.
+    int gain_q8 = 0;
+    if (comp_state == ESP_OK) {
+        gain_q8 = (int)(compensate_gain * 256.0f + 0.5f);
+        if (gain_q8 < 1) {
+            gain_q8 = 1;
+        } else if (gain_q8 > 65535) {
+            gain_q8 = 65535;
+        }
     }
     frame[16] = (uint8_t)(gain_q8 & 0xff);
     frame[17] = (uint8_t)(gain_q8 >> 8);
-    frame[18] = (uint8_t)info->first_word_invalid;
-    frame[19] = 0;
+    frame[18] = agc_gain;
+    frame[19] = (uint8_t)fft_gain;
+    frame[20] = (uint8_t)info->first_word_invalid;
+    frame[21] = 0;
+    frame[22] = 0;
+    frame[23] = 0;
     for (int i = 0; i < n_sub; i++) {
         int k = (n_sub == n_avail) ? i : tbl[i];
         frame[CSI_FRAME_HDR + 2 * i]     = (uint8_t)info->buf[k * 2];      // imag
@@ -530,15 +844,14 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     frame[n_end] = (uint8_t)(sum & 0xff);
     frame[n_end + 1] = (uint8_t)(sum >> 8);
 
-    // Same UART path as ets_printf (direct ROM writes to the FIFO), so binary frames
-    // and ROLE_* text stay strictly ordered. The mutex keeps a role marker from the
-    // command task out of the middle of a frame.
-    xSemaphoreTake(print_mux, portMAX_DELAY);
-    for (int i = 0; i < n_end + 2; i++) {
-        esp_rom_uart_tx_one_char(frame[i]);
-    }
-    xSemaphoreGive(print_mux);
-    s_count++;
+    // One atomic copy into the driver's interrupt-driven TX ring, then return. The
+    // old path shifted every byte into the FIFO from THIS task -- the WiFi task --
+    // busy-waiting ~3.8 ms per 166-SC frame: that was the measured rate knee, the
+    // above-knee loss cliff, and most of the per-frame cost that capped 30 SC at
+    // ~750 Hz. A full ring drops the whole frame, counted in STATS, so saturation
+    // degrades visibly instead of stalling the radio.
+    emit(frame, n_end + 2);
+    csi_count++;
 }
 
 static void wifi_init(void)
@@ -554,10 +867,10 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    if (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT20) {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    } else {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
+    // Through apply_channel so boot and "CHAN <n>" cannot drift apart on how the
+    // HT40 secondary is placed.
+    if (!apply_channel(CONFIG_LESS_INTERFERENCE_CHANNEL)) {
+        ESP_LOGE(TAG, "could not set channel %d", CONFIG_LESS_INTERFERENCE_CHANNEL);
     }
 
     // Unlike csi_send/csi_recv, we deliberately do NOT override the STA MAC here:
@@ -613,9 +926,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Before wifi_csi_init() or the command task, so nothing can print unguarded.
-    print_mux = xSemaphoreCreateMutex();
-    ESP_ERROR_CHECK(print_mux ? ESP_OK : ESP_ERR_NO_MEM);
+    // The UART driver before anything can print: a 24 KB interrupt-driven TX ring
+    // so every emitter enqueues and returns (the WiFi task included -- see emit()),
+    // and a 2 KB RX ring so commands survive a busy wire (the bare 128 B hardware
+    // FIFO is how SCAN used to eat role commands: everything past 128 B vanished).
+    // Routing the VFS console through the driver also serialises ESP_LOG onto the
+    // same ring, closing the interleave-mid-frame hole print_mux never covered.
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 2048, 24576, 0, NULL, 0));
+    uart_vfs_dev_use_driver(UART_NUM_0);
 
     init_led();
     set_led(40, 0, 0); // default to red/RX until the PC says otherwise

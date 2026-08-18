@@ -61,6 +61,104 @@ TS_WRAP = 1 << 32                  # the board counter is 32-bit microseconds
 
 LABEL = {'2d:3c': 'A', '6b:5c': 'B', 'ab:d4': 'C', '2d:a8': 'D'}
 
+# ------------------------------------------------------------ subcarrier layout
+# The radio reports 192 subcarriers as three 64-wide fields (LLTF | HT-LTF |
+# STBC-HT-LTF) whose gains differ by roughly 5x, and 26 of the 192 are guard bands
+# or DC that read ~0 in every capture.
+FIELD_WIDTH = 64
+DEAD_SUB = (set(range(0, 6)) | {32} | set(range(59, 66))
+            | set(range(123, 134)) | {191})
+
+# Mirrors SUB_INDEX_* in firmware/main/app_main.c. The firmware *compacts* a frame
+# to only the subcarriers it sends, so row i of a 166-wide frame is original
+# subcarrier SUB_INDEX[166][i] -- the field boundaries are then no longer every 64
+# rows. Anything normalising per field must map through this; see field_bounds.
+SUB_INDEX = {
+    192: list(range(192)),
+    166: [i for i in range(192) if i not in DEAD_SUB],
+    # every HT-LTF subcarrier: 166 minus the 52 5x-weaker legacy-LLTF duplicates
+    114: [i for i in range(66, 191) if i not in DEAD_SUB],
+    30: [66, 70, 74, 78, 82, 85, 89, 93, 97, 101, 105, 109, 113, 117, 121,
+         135, 139, 143, 147, 151, 155, 159, 163, 167, 171, 174, 178, 182, 186, 190],
+}
+
+
+def derive_fields(mean_amp, min_ratio=3.0, win=8, min_sep=12):
+    """Field boundaries measured from the data instead of assumed from a table.
+
+    Worth measuring rather than tabulating, because the tabulated answer is wrong.
+    The layout is documented here as three 64-wide fields, but the radio's own output
+    says otherwise: on a live HT40 link the second and third 64-blocks have the same
+    mean amplitude to within 3% (43.1 against 44.3) while the first is 4.8x lower.
+    64-191 is one 128-wide HT-LTF whose centre null is the dead band at 123-133, so
+    there is exactly one gain step, at 64. A hardcoded three-way split draws a
+    boundary where no step exists -- and would be wrong differently again at HT20,
+    where the whole layout changes.
+
+    min_ratio is 3 rather than 2 because a deep multipath fade can hold a 2x level
+    difference across a whole window and register as a phantom boundary -- observed
+    live at row 106 of a 166-wide link. The real hardware step measures 4.8x, so 3x
+    separates the two cleanly.
+
+    A gain step is directly observable, so this observes it: walk the live
+    subcarriers and compare the median level of the window before each position with
+    the window after. Positions whose ratio clears `min_ratio` are candidates; the
+    strongest in each cluster wins, and `min_sep` keeps one step from registering
+    twice. Dead subcarriers sit near zero and would dominate any window they fell in,
+    so they are excluded from the statistics rather than from the row numbering.
+
+    Returns [(lo, hi), ...] covering 0..len(mean_amp), so a caller can normalise per
+    field without knowing the bandwidth or the subcarrier count.
+    """
+    a = np.asarray(mean_amp, dtype=float)
+    n = len(a)
+    if n < 4 * win:
+        return [(0, n)]
+    pos = a[a > 0]
+    if pos.size == 0:
+        return [(0, n)]
+    live = a > 0.05 * np.median(pos)
+    if live.sum() < 2 * win:
+        return [(0, n)]
+
+    scores = np.zeros(n)
+    for i in range(win, n - win):
+        lo = a[i - win:i][live[i - win:i]]
+        hi = a[i:i + win][live[i:i + win]]
+        if lo.size < max(2, win // 2) or hi.size < max(2, win // 2):
+            continue
+        r = np.median(hi) / max(np.median(lo), 1e-9)
+        if r >= min_ratio or r <= 1.0 / min_ratio:
+            scores[i] = abs(np.log(r))
+
+    cuts = []
+    order = np.argsort(scores)[::-1]
+    for i in order:
+        if scores[i] <= 0:
+            break
+        if all(abs(i - c) >= min_sep for c in cuts):
+            cuts.append(int(i))
+    cuts.sort()
+
+    edges = [0] + cuts + [n]
+    return [(edges[k], edges[k + 1]) for k in range(len(edges) - 1)]
+
+
+def field_bounds(n_sub):
+    """Fallback boundaries for a frame width, used only before any data has arrived.
+
+    derive_fields is the real answer; this exists so the first repaint has something
+    sane. It splits at the one boundary the hardware actually has -- the LLTF/HT-LTF
+    step at original subcarrier 64 -- rather than at every 64th row.
+    """
+    idx = SUB_INDEX.get(n_sub)
+    if idx is None:
+        return [(0, n_sub)]
+    rows = [i for i, o in enumerate(idx) if o >= FIELD_WIDTH]
+    if not rows or rows[0] == 0:
+        return [(0, n_sub)]
+    return [(0, rows[0]), (rows[0], n_sub)]
+
 YELLOW, GREEN, WHITE = (40, 30, 0), (0, 40, 0), (30, 30, 30)
 
 # ---------------------------------------------------------------- V4L2 capture
@@ -176,6 +274,7 @@ class Camera:
     anything this needs."""
 
     def __init__(self, dev, w, h, fps, nbuf=8):
+        self.name = str(dev)
         self.fd = os.open(dev, os.O_RDWR)
         f = Format(type=CAPTURE)
         f.pix.width, f.pix.height, f.pix.pixelformat, f.pix.field = w, h, fourcc('YUYV'), 1
@@ -226,6 +325,13 @@ class Camera:
             m.close()
         os.close(self.fd)
 
+    def to_rgb(self, buf, w, h):
+        """Frames from this camera, as RGB. Lives on the camera because it is a
+        property of the device, not of the caller: a second backend (see MacCamera)
+        hands back a different pixel format, and every consumer that hard-codes
+        yuyv_to_rgb would then decode it as garbage rather than fail."""
+        return yuyv_to_rgb(buf, w, h)
+
 
 def yuyv_to_rgb(buf, w, h):
     """Packed 4:2:2 to RGB, BT.601 limited range (what UVC cameras emit).
@@ -244,6 +350,294 @@ def yuyv_to_rgb(buf, w, h):
     g = (298 * c - 100 * u - 208 * v + 128) >> 8
     b = (298 * c + 516 * u + 128) >> 8
     return np.clip(np.stack([r, g, b], -1), 0, 255).astype(np.uint8)
+
+
+class MacCamera:
+    """AVFoundation capture through OpenCV, for running the rig on a Mac.
+
+    The V4L2 path above cannot be made to work here: macOS has no /dev/video*
+    and no video4linux sysfs, so there is nothing to enumerate and no ioctl to
+    call. This is deliberately the same shape as Camera -- start/read/close plus
+    to_rgb -- so the viewer and the recorder consume either without knowing which
+    one they are holding.
+
+    Two things are genuinely worse on this backend, and the recorded metadata
+    says so rather than quietly implying otherwise:
+
+      * **No driver timestamp.** AVFoundation's presentation time is not exposed
+        through VideoCapture, so a frame is stamped when it reaches us and
+        `monotonic` is False -- which routes callers to their time.time() branch.
+        The extra error is grab-loop scheduling jitter, ~1 frame at 30 fps.
+      * **No driver sequence number.** `seq` is a local counter, so it cannot
+        gap. On V4L2 a gap in `sequence` is exactly what makes an OS-dropped
+        frame countable; here such a frame is invisible, and the frame-drop
+        figures in RECORDING_2026-08-12.md have no equivalent for macOS sessions.
+
+    Neither disturbs CSI/video alignment more than the grab jitter already does,
+    because alignment is done offline from these same timestamps. Do not use this
+    backend to make claims about dropped video frames.
+    """
+
+    def __init__(self, index, w, h, fps, name=None):
+        import cv2
+        self.cv2 = cv2
+        self.index = int(index)
+        self.cap = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
+        if not self.cap.isOpened():
+            raise RuntimeError(
+                f'could not open camera index {self.index}. Another process may hold '
+                f'it, or this terminal has not been granted camera access in System '
+                f'Settings > Privacy & Security > Camera.')
+        # Identify before sizing: the fingerprint is the largest mode this device
+        # offers, which is only readable while nothing narrower has been requested.
+        if name is None:
+            name = _identify_capture(self.cap)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        # Read back rather than trust: AVFoundation silently substitutes the nearest
+        # supported mode, and metadata claiming a geometry the frames do not have is
+        # worse than metadata admitting the substitution.
+        self.w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or w
+        self.h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or h
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or fps
+        self.name = (f'{name} (index {self.index})' if name
+                     else f'AVFoundation index {self.index}')
+        self.monotonic = False
+        self.seq = 0
+
+    def start(self):
+        pass                      # VideoCapture streams from the moment it opens
+
+    def read(self, timeout=1.0):
+        """(sequence, timestamp, BGR frame) or None. `timeout` is accepted for
+        interface parity and ignored: VideoCapture.read blocks until the next
+        frame and offers no way to bound that wait."""
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            return None
+        self.seq += 1
+        return self.seq - 1, time.time(), frame
+
+    def to_rgb(self, buf, w, h):
+        # cvtColor, not buf[:, :, ::-1]: the reversed view is not contiguous, and
+        # both consumers -- QImage and PIL -- read the buffer directly and would
+        # render the stride as tearing rather than raise.
+        return self.cv2.cvtColor(buf, self.cv2.COLOR_BGR2RGB)
+
+    def close(self):
+        self.cap.release()
+
+
+def mac_video_devices():
+    """Every AVFoundation camera: name, type, and its largest-area mode.
+
+    Needs pyobjc; returns [] without it, which callers treat as "cannot identify"
+    rather than "no cameras".
+    """
+    try:
+        import AVFoundation as AV
+        import CoreMedia
+    except ImportError:
+        return []
+    out = []
+    for d in AV.AVCaptureDevice.devicesWithMediaType_(AV.AVMediaTypeVideo):
+        dims = []
+        for f in d.formats():
+            m = CoreMedia.CMVideoFormatDescriptionGetDimensions(f.formatDescription())
+            dims.append((int(m.width), int(m.height)))
+        if not dims:
+            continue
+        kind = str(d.deviceType()).replace('AVCaptureDeviceType', '')
+        out.append(dict(name=str(d.localizedName()), kind=kind,
+                        builtin=kind.startswith('BuiltIn'),
+                        best=max(dims, key=lambda wh: wh[0] * wh[1])))
+    return out
+
+
+def _opencv_max_mode(index):
+    """The largest-area mode OpenCV will give for this index, or None if it won't open.
+
+    Asking for an absurd size and reading back what survives is how the index is
+    identified -- see mac_camera_index.
+    """
+    import cv2
+    cap = cv2.VideoCapture(int(index), cv2.CAP_AVFOUNDATION)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 100000)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 100000)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        return (w, h) if w and h else None
+    finally:
+        cap.release()
+
+
+def _identify_capture(cap):
+    """The name of the device this open capture is actually reading, or None.
+
+    Same fingerprint as mac_camera_index, but run on a capture we already hold, so
+    naming the camera costs nothing extra and happens even when an index was given
+    explicitly. A viewer that prints the device it truly opened is the check that
+    catches a mis-set --device before a session is recorded, not after.
+    """
+    import cv2
+    devs = mac_video_devices()
+    if not devs:
+        return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 100000)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 100000)
+    best = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    hits = [d for d in devs if d['best'] == best]
+    return hits[0]['name'] if len(hits) == 1 else None
+
+
+def mac_camera_index(match=None, max_probe=8):
+    """(OpenCV index, device name) for the camera `match` names, by identity not order.
+
+    **OpenCV's index order is not AVFoundation's list order.** Measured on this
+    machine with a built-in camera and an iPhone attached over Continuity: pyobjc
+    lists [FaceTime, iPhone] while OpenCV's indices are [iPhone, FaceTime] -- exactly
+    reversed. So taking a device's position in the AVFoundation list and passing it to
+    VideoCapture silently opens the *other* camera, which is how a session gets
+    recorded through a phone lying face-down on the desk.
+
+    The two are matched by fingerprint instead. OpenCV selects a device's
+    largest-area mode when asked for an impossible size, and that mode differs per
+    camera (here 1552x1552 built-in against 1920x1440 for the phone), so it
+    identifies which device an index actually opened.
+
+    `match` is a case-insensitive substring of the camera name, or None for the
+    built-in one. Returns (None, None) when the answer cannot be established --
+    pyobjc missing, no match, or an ambiguous fingerprint -- so the caller can fall
+    back loudly rather than open an arbitrary camera and claim it was the right one.
+    """
+    devs = mac_video_devices()
+    if not devs:
+        return None, None
+    if match is None:
+        wanted = [d for d in devs if d['builtin']]
+    else:
+        wanted = [d for d in devs if match.lower() in d['name'].lower()]
+    if len(wanted) != 1:
+        return None, None
+    want = wanted[0]
+    # Ambiguous fingerprint: two cameras whose largest mode is the same size cannot be
+    # told apart this way, and guessing between them is the failure this exists to stop.
+    if sum(d['best'] == want['best'] for d in devs) != 1:
+        return None, None
+    # Probe the LIKELY index first, not index 0 upward: opening a Continuity iPhone
+    # (merely to fingerprint it) wakes the phone on the desk, every launch. OpenCV's
+    # index order measured on this machine is AVFoundation's list order reversed, so
+    # that guess is tried first and, when right -- the normal case -- the only camera
+    # ever opened is the one asked for.
+    guess = (len(devs) - 1) - devs.index(want)
+    order = [guess] + [i for i in range(max_probe) if i != guess]
+    for i in order:
+        if _opencv_max_mode(i) == want['best']:
+            return i, want['name']
+    return None, None
+
+
+def default_camera_device():
+    """What `--device auto` means on this machine.
+
+    Linux is the rig proper: find the RealSense colour node by capability. On macOS
+    it is the *built-in* camera, resolved by identity -- never simply index 0, which
+    is the attached phone as often as not.
+    """
+    if sys.platform != 'darwin':
+        return find_colour_node()
+    idx, name = mac_camera_index()
+    if idx is None:
+        print('warning: could not identify the built-in camera; falling back to '
+              'index 0. Pass --device <index or name> to choose explicitly.',
+              file=sys.stderr, flush=True)
+        return '0'
+    return str(idx)
+
+
+def open_camera(dev, w, h, fps):
+    """A camera for `dev`, choosing the backend the device identifies.
+
+    A path is a V4L2 node. A bare integer is an AVFoundation index, used as given so
+    an explicit `--device 1` is never second-guessed. Anything else is a camera name
+    to match on macOS, which is the stable way to ask for one: indices move when a
+    Continuity camera comes and goes, names do not.
+    """
+    dev = str(dev)
+    if dev.isdigit():
+        return MacCamera(dev, w, h, fps)
+    if sys.platform == 'darwin':
+        idx, name = mac_camera_index(dev)
+        if idx is None:
+            names = [d['name'] for d in mac_video_devices()]
+            raise SystemExit(f'no single camera matches {dev!r}. Available: {names}')
+        return MacCamera(idx, w, h, fps, name=name)
+    return Camera(dev, w, h, fps)
+
+
+# --------------------------------------------------------------- channel choice
+
+def ht40_span(primary, ht40=True):
+    """The 20 MHz channels an HT40 block on `primary` overlaps.
+
+    This is the whole reason a per-channel survey cannot be read off directly. The
+    firmware places the secondary *below* a primary of 5 or more and above a lower
+    one (apply_channel in app_main.c), so the 40 MHz block is centred two channels
+    away from the primary rather than on it -- "channel 11" is really a block
+    centred on 9. Channels sit 5 MHz apart and are 20 MHz wide, so channel c
+    overlaps when its centre is within 30 MHz of the block centre.
+    """
+    if not ht40:
+        return [c for c in range(1, 14) if abs(c - primary) * 5 < 20]
+    sec = primary - 4 if primary >= 5 else primary + 4
+    centre = (primary + sec) / 2.0
+    return [c for c in range(1, 14) if abs(c - centre) * 5 < 30]
+
+
+def rank_channels(stats, ht40=True):
+    """[(primary, bytes, worst_rssi, span)] for every primary, quietest first.
+
+    Ranked on bytes seen -- an airtime proxy, and airtime is what actually collides
+    with ESP-NOW -- with the strongest interferer in the span as the tie-break and
+    as something the caller should show, because a close AP desenses the receiver
+    even when it is not talking much. Deliberately not a single blended score: the
+    two effects have no honest common unit, and inventing a weighting would hide
+    which one drove the answer.
+    """
+    out = []
+    for p in range(1, 14):
+        span = ht40_span(p, ht40)
+        if not span:
+            continue
+        nbytes = sum(stats.get(c, {}).get('bytes', 0) for c in span)
+        rssi = max((stats[c]['rssi_max'] for c in span if c in stats), default=-128)
+        out.append((p, nbytes, rssi, span))
+    out.sort(key=lambda t: (t[1], t[2]))
+    return out
+
+
+def parse_scan_line(line):
+    """('ch', ch, pkts, bytes, rssi_mean, rssi_max) | ('done', ch) | None."""
+    if line.startswith('SCAN_CH,'):
+        f = line.split(',')
+        if len(f) == 6:
+            try:
+                return ('ch',) + tuple(int(x) for x in f[1:])
+            except ValueError:
+                return None
+    elif line.startswith('SCAN_DONE'):
+        f = line.split(',')
+        try:
+            return ('done', int(f[1])) if len(f) > 1 else ('done', 0)
+        except ValueError:
+            return ('done', 0)
+    return None
 
 
 # ------------------------------------------------------------------ CSI boards
@@ -371,7 +765,9 @@ FRAME_TAIL = 2          # sum16
 # raw int8 I/Q with the AGC gain in the two header bytes v1 spends on a clip counter.
 # Both are parsed here rather than behind a mode flag: the 450 recorded takes are v1
 # and must stay readable with the same code that reads whatever we record next.
-FRAME_FMT = {1: (18, 1), 2: (20, 2)}
+# v3 widens the header to 24: raw (agc, fft) gain pair at 18-19 beside the Q8.8
+# factor, first_word_invalid at 20. Same payload encoding as v2.
+FRAME_FMT = {1: (18, 1), 2: (20, 2), 3: (24, 2)}
 
 
 class CsiStream:
@@ -445,17 +841,33 @@ class CsiStream:
             if bps == 1:
                 amp = np.frombuffer(frame, dtype=np.uint8, count=n_sub,
                                     offset=hdr).astype(np.float32)
-                recs.append((mac, lts, rssi, amp, frame[16], None))
+                recs.append((mac, lts, rssi, amp, frame[16], None, None))
             else:
                 # The board sends I/Q uncompensated and passes the AGC factor here as
                 # Q8.8, because scaling on-board would round back into int8 and lose
                 # the low bits phase depends on. Applying it host-side is free.
-                gain = (frame[16] | (frame[17] << 8)) / 256.0
+                gain_q8 = (frame[16] | (frame[17] << 8)) / 256.0
+                # v3 reserves 0 as "AGC not yet calibrated" (the first ~100 frames
+                # after boot or a retune). Ship those raw rather than scaled by a
+                # made-up factor -- v2 shipped exactly that lie as 1.0x. The raw
+                # field value travels in the record's metadata, sentinel intact.
+                gain = gain_q8 if gain_q8 > 0 else 1.0
                 pay = np.frombuffer(frame, dtype=np.int8, count=2 * n_sub, offset=hdr)
                 iq = (pay[1::2].astype(np.float32)             # real
                       + 1j * pay[0::2].astype(np.float32))     # imag
                 iq = (iq * gain).astype(np.complex64)
-                recs.append((mac, lts, rssi, np.abs(iq), 0, iq))
+                # Saturated int8 samples: with AGC locked a loud scene clips here
+                # silently, so the count rides in the slot v1 used for clipping.
+                sat = int((np.abs(pay.astype(np.int16)) >= 127).sum())
+                # (gain_q8, raw agc, raw fft): what a recording needs to recover the
+                # exact wire int8s (iq / gain) and to segment at gain steps. v2
+                # frames have no raw pair; zeros mark that honestly.
+                if hdr == 24:
+                    fft = frame[19] - 256 if frame[19] > 127 else frame[19]
+                    gmeta = (gain_q8, frame[18], fft)
+                else:
+                    gmeta = (gain_q8, 0, 0)
+                recs.append((mac, lts, rssi, np.abs(iq), sat, iq, gmeta))
             del self.buf[:total]
 
 
@@ -479,8 +891,12 @@ class JpegWriter:
     both produce identical frame directories.
     """
 
-    def __init__(self, frame_dir, quality=85, threads=3, maxsize=120, own=None):
+    def __init__(self, frame_dir, quality=85, threads=3, maxsize=120, own=None,
+                 to_rgb=None):
         self.dir, self.quality, self.own = frame_dir, quality, own
+        # Default keeps every existing caller byte-identical; the viewer passes the
+        # camera's own converter so a macOS session encodes BGR as BGR.
+        self.to_rgb = to_rgb or yuyv_to_rgb
         os.makedirs(frame_dir, exist_ok=True)
         give(frame_dir, own)
         self.q = queue.Queue(maxsize=maxsize)
@@ -497,7 +913,7 @@ class JpegWriter:
                 return
             idx, buf, w, h = item
             bio = io.BytesIO()
-            Image.fromarray(yuyv_to_rgb(buf, w, h)).save(bio, 'JPEG', quality=self.quality)
+            Image.fromarray(self.to_rgb(buf, w, h)).save(bio, 'JPEG', quality=self.quality)
             path = os.path.join(self.dir, f'{idx:06d}.jpg')
             with open(path, 'wb') as fh:
                 fh.write(bio.getvalue())
@@ -522,13 +938,21 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
     Kept module-level and shared so the live viewer and the headless recorder cannot
     drift into two different on-disk formats.
 
-      recs   {rx_mac: [(host_time, tx_mac, board_us, rssi, amplitudes, iq), ...]}
+      recs   {rx_mac: [(host_time, tx_mac, board_us, rssi, amplitudes, iq,
+              (gain_q8, agc, fft) | None), ...]}
       frames [(index, driver_sequence, wall_time), ...]
 
     `tx|rx|t` and `tx|rx|a` stay byte-compatible with capture_wizard.py. When the
     boards are sending I/Q (frame version 2) an extra complex64 `tx|rx|iq` is written
     alongside; `a` remains its magnitude, so a reader that only knows about amplitude
     sees exactly what it saw before and phase is additive rather than a new format.
+
+    With v2/v3 frames three more per-packet arrays land beside `iq`: `gain` (the
+    Q8.8 factor already multiplied into `iq` and `a`; 0.0 = the board's AGC was not
+    yet calibrated and nothing was applied), and the raw `agc` / `fft` gain indices
+    (v3 only; zeros under v2). Recordings are thereby complete: the exact wire int8
+    I/Q is `iq / gain`, absolute amplitude can be re-referenced against any
+    baseline, and phase can be segmented at gain steps.
     """
     out, report = {}, []
     ft = np.array([f[2] for f in frames], dtype=np.float64) - t0
@@ -539,15 +963,15 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
 
     for rx, items in recs.items():
         by_tx = {}
-        for t, tx, lts, rssi, amp, iq in items:
-            by_tx.setdefault(tx, []).append((t, lts, rssi, amp, iq))
+        for t, tx, lts, rssi, amp, iq, gm in items:
+            by_tx.setdefault(tx, []).append((t, lts, rssi, amp, iq, gm))
         for tx, seq in by_tx.items():
             if len(seq) < 5:
                 continue
             # Truncated UART lines show up as a minority subcarrier count; keep
             # the modal width so the stack is rectangular.
             lens = {}
-            for _t, _l, _r, x, _q in seq:
+            for _t, _l, _r, x, _q, _g in seq:
                 lens[len(x)] = lens.get(len(x), 0) + 1
             n = max(lens, key=lens.get)
             seq = [s for s in seq if len(s[3]) == n]
@@ -557,6 +981,10 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
             out[f'{k}|a'] = np.stack([s[3] for s in seq])
             if all(s[4] is not None for s in seq):
                 out[f'{k}|iq'] = np.stack([s[4] for s in seq]).astype(np.complex64)
+            if all(s[5] is not None for s in seq):
+                out[f'{k}|gain'] = np.array([s[5][0] for s in seq], dtype=np.float32)
+                out[f'{k}|agc'] = np.array([s[5][1] for s in seq], dtype=np.int16)
+                out[f'{k}|fft'] = np.array([s[5][2] for s in seq], dtype=np.int16)
             out[f'{k}|rssi'] = np.array([s[2] for s in seq], dtype=np.int16)
             out[f'{k}|lts'] = unwrap_us([s[1] for s in seq]) / 1e6
             worst = None
@@ -599,10 +1027,10 @@ class Recorder:
         self.prefix = resolve_prefix(args.prefix, args.outdir)
         self.frame_dir = f'{self.prefix}_frames'
         self.own = owner_of(self.prefix)
+        self.cam = open_camera(args.device, args.width, args.height, args.fps)
         self.jpeg = JpegWriter(self.frame_dir, args.quality, args.encoders,
-                               args.queue, self.own)
+                               args.queue, self.own, self.cam.to_rgb)
 
-        self.cam = Camera(args.device, args.width, args.height, args.fps)
         # One offset, measured once: CLOCK_MONOTONIC and the wall clock drift apart
         # far too slowly to matter across a capture, and re-measuring per frame would
         # inject the very scheduling jitter the driver timestamp exists to avoid.
@@ -649,9 +1077,9 @@ class Recorder:
             if not self.collecting:
                 continue
             now = time.time()
-            for mac, lts, rssi, amp, clipped, iq in recs:
+            for mac, lts, rssi, amp, clipped, iq, gmeta in recs:
                 self.clipped += clipped
-                self.recs[rx].append((now, mac, lts, rssi, amp, iq))
+                self.recs[rx].append((now, mac, lts, rssi, amp, iq, gmeta))
         self.read_errors += st.bad
 
     def radio(self):
@@ -841,7 +1269,7 @@ def main():
         args.outdir = default_outdir()
 
     if args.device == 'auto':
-        args.device = find_colour_node()
+        args.device = default_camera_device()
         if args.device is None:
             raise SystemExit('no RealSense colour node found. Is the camera plugged '
                              'in, and does this container have "c 81:* rmw"?')
