@@ -59,7 +59,12 @@ TS_FIELD = 18                      # local_timestamp, microseconds, per the firm
 RSSI_FIELD = 3
 TS_WRAP = 1 << 32                  # the board counter is 32-bit microseconds
 
-LABEL = {'2d:3c': 'A', '6b:5c': 'B', 'ab:d4': 'C', '2d:a8': 'D'}
+# 'E' is the returned fifth board (ec:da:3b:4c:b8:d0 / 5C39018759). Its documented
+# RX fault (11x same-pair asymmetry) did NOT reproduce on the 2026-08-24 matrix
+# retest -- 100% as receiver, best of four -- but it keeps its own letter so it can
+# never be confused with the original A, and the intermittent-fault suspicion in
+# NOTES.md stays attached to this silicon, not to whatever slot it occupies.
+LABEL = {'2d:3c': 'A', '6b:5c': 'B', 'ab:d4': 'C', '2d:a8': 'D', 'b8:d0': 'E'}
 
 # ------------------------------------------------------------ subcarrier layout
 # The radio reports 192 subcarriers as three 64-wide fields (LLTF | HT-LTF |

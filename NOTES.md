@@ -695,3 +695,54 @@ normalisation in preprocessing (and the viewer's Level-lock for display). The
 commands stay in the firmware for re-testing elsewhere; the GUI button was removed
 so the everyday path cannot degrade a recording by accident. The host now counts
 saturated int8 samples per packet (v2/v3 parse) as the clipping telltale either way.
+
+## 2026-08-24 — round-robin tuned: the handoff is cheap and the ceiling was imaginary
+
+Two-board sweep on the audited firmware (SUB 30, host-driven rotation):
+
+* **Dwell**: 100 ms delivers 98.4% but touches only 67% of camera frames per link
+  (bursts miss frames); 25 ms and below touch 100%. The frame-locked dwell
+  (cycle = one 33 ms camera frame) costs ~3% handoff tax; even 8 ms costs only ~8%.
+* **Rate**: round-robin sustains RATE 1600 at ~93% delivery flat from 1000 up —
+  each receiver's UART carries only its share, so the pinned-mode ceiling (1071 at
+  SUB 30) does not apply. Two boards at 1600 = ~745 Hz per link, both links,
+  100% frame coverage.
+* **Four-board projection** (unverified until B/C are flashed and attached): each
+  RX carries 3/4 of the rate → R≈1300 fits the wire → ~325 Hz × 12 links, ~10
+  packets per camera frame per link at 8.3 ms dwell — ~13× the per-link density of
+  the 2026-08-12 campaign, with phase.
+
+The viewer's rate clamp is now mode-aware (round-robin ceiling = pinned × n/(n-1),
+firmware cap 2000).
+
+## 2026-08-24 (later) — the "faulty" fifth board returned, and passed
+
+Original board A (14:c1:9f:c1:2d:3c / 5C37261255) left the rig; the board swapped
+into its place is the fifth board this log records as returned-faulty
+(ec:da:3b:4c:b8:d0 / 5C39018759, broken receive path, 49.5 vs 4.5 pkt/s). Re-tested
+on the audited firmware before trusting it: the decisive same-pair both-directions
+test showed only 1.6× asymmetry immediately after flashing (a boot-race transient —
+its RX command likely landed before the command task was up), and the steady-state
+test — D transmitting to all three receivers simultaneously — delivered **98.4% to
+this board with the strongest RSSI of the three** (−20 dBm; B −21, C −35). The
+documented fault did not reproduce. It now carries the label A (`LABEL` in
+capture.py maps `b8:d0` → A). Treat the old fault as possibly intermittent: if A's
+links ever show asymmetric loss, this board is the first suspect.
+
+### Side-by-side matrix retest, 2026-08-24
+
+All four boards adjacent (matched path loss), full 12-link matrix at 243 Hz:
+every link 98.4–100%, every same-pair asymmetry 1.0× (the fault this board was
+returned for measured 11×), and as a receiver the returned board scored **100.0%
+— the best of the four**. The documented fault is gone: repaired on return, a
+reseated antenna contact, or intermittent. The suspicion note above stands, but
+as of today this is the healthiest RX in the rig.
+
+### A/B comparison of the two "A-slot" boards, 2026-08-24
+
+Same slot, same side-by-side layout, same 12-link matrix, minutes apart: the
+returned board (now labelled E) scored 98.7% TX / 100.0% RX; the original A
+scored 99.6% TX / 99.2% RX. All same-pair asymmetries 1.0x for both. The two are
+statistically indistinguishable — the rig has a verified healthy spare for the
+first time. E keeps its own label so the NOTES suspicion stays attached to the
+silicon rather than the slot.

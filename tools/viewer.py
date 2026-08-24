@@ -285,6 +285,11 @@ class Live(QWidget):
         # same everywhere and nothing rescales itself while you watch.
         self.wf_min = float(args.wf_min)
         self.wf_max = float(args.wf_max)
+        # Per-link scale overrides, set by FIT: a near link and a far link differ
+        # hugely in level, and one shared scale leaves the far panels flat while the
+        # near ones clip. The boxes stay the global default; editing them clears
+        # the per-link fits (explicit global intent).
+        self.link_scale = {}
         # The observed amplitude range since start / last recalibrate: the reference
         # for choosing the fixed scale, shown beside the boxes.
         self.seen_min = None
@@ -417,10 +422,20 @@ class Live(QWidget):
         self.sub_buttons[166].setChecked(True)
         radio_bar.addSpacing(16)
         radio_bar.addWidget(QLabel('Hz'))
-        self.rate_edit = QLineEdit(str(self.rate_val))
-        self.rate_edit.setFixedWidth(96)
-        self.rate_edit.returnPressed.connect(self.set_rate)
-        radio_bar.addWidget(self.rate_edit)
+        self.rate_buttons = {}
+        rate_group = QButtonGroup(self)
+        rate_group.setExclusive(True)
+        for key in ('low', 'mid', 'high', 'max'):
+            b = QPushButton('')
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c, k=key: self.pick_rate_preset(k))
+            rate_group.addButton(b)
+            radio_bar.addWidget(b)
+            self.rate_buttons[key] = b
+        # Boot RATE 243 sits nearest 50% of the boot config's ceiling; labels are
+        # filled in once tx_sel exists (refresh_rate_buttons at init tail).
+        self.rate_preset = 'mid'
+        self.rate_buttons['mid'].setChecked(True)
         self.view_btn = QPushButton('View: spectrum')
         self.view_btn.clicked.connect(self.toggle_view)
         radio_bar.addWidget(self.view_btn)
@@ -508,6 +523,7 @@ class Live(QWidget):
         start = args.tx if args.tx in self.by_label else 'round-robin'
         self.tx_sel = start
         self.tx_buttons[start].setChecked(True)
+        self.refresh_rate_buttons()
         self.style_csi_button()
 
         for m in self.macs:
@@ -541,6 +557,7 @@ class Live(QWidget):
         if hi <= lo:
             lo, hi = self.wf_min, self.wf_max
         self.wf_min, self.wf_max = lo, hi
+        self.link_scale.clear()          # typed bounds mean: everyone, this scale
         self.wfmin_edit.setText(f'{lo:g}')
         self.wfmax_edit.setText(f'{hi:g}')
 
@@ -550,21 +567,20 @@ class Live(QWidget):
         about two colour steps -- which is why a wide fixed scale reads as "not
         moving". Fitting spends the whole colormap on the real range; the scale
         stays fixed afterwards until fitted or edited again."""
-        # CURRENT range, not the all-time record: the seen readout keeps history as
-        # a reference, but fitting to it means one loud event an hour ago pins the
-        # scale forever. FIT reads what is in the display buffers right now.
+        # Per LINK, from the CURRENT buffers: each panel gets bounds hugged to its
+        # own signal, so a 3 m link and a 4.2 m diagonal are both readable at once.
         with self.lock:
-            vals = [it[2] for v in self.buf.values() for it in v]
-        if not vals:
-            return
-        A = np.concatenate(vals)
-        lo = float(np.floor(A.min()))
-        hi = float(np.ceil(A.max()))
-        if hi <= lo:
-            hi = lo + 1
-        self.wf_min, self.wf_max = lo, hi
-        self.wfmin_edit.setText(f'{lo:g}')
-        self.wfmax_edit.setText(f'{hi:g}')
+            snap = {k: [it[2] for it in v] for k, v in self.buf.items() if len(v) > 3}
+        n = 0
+        for k, vals in snap.items():
+            A = np.concatenate(vals)
+            lo, hi = float(np.floor(A.min())), float(np.ceil(A.max()))
+            if hi <= lo:
+                hi = lo + 1
+            self.link_scale[k] = (lo, hi)
+            n += 1
+        if n:
+            self.rec_status.setText(f'scale fitted per link ({n} links)')
 
     def toggle_level_lock(self):
         """raw: exactly what the boards deliver and the recording stores. norm: the
@@ -644,7 +660,8 @@ class Live(QWidget):
                 if m > 0:
                     y = y * (ref / m)
             c.setData(xs, y)
-        pan['plot'].setYRange(self.wf_min, self.wf_max, padding=0)
+        lo, hi = self.link_scale.get(key, (self.wf_min, self.wf_max))
+        pan['plot'].setYRange(lo, hi, padding=0)
         pan['plot'].setXRange(xs[0], xs[-1], padding=0.01)
 
     def rebuild_panels(self, bounds):
@@ -1099,6 +1116,16 @@ class Live(QWidget):
         else:
             verdict = f'⚡ <b>ch{self.args.channel}</b> already best'
         self.scan_label.setText(verdict)
+        # Move only on a meaningful win: your last survey ranked the top five
+        # placements within 1.5% of each other -- a statistical tie -- and moving
+        # the whole rig on that is churn, not optimisation.
+        if moved and cur and cur[1] > best_bytes:
+            pct = 100.0 * (cur[1] - best_bytes) / max(cur[1], 1)
+            if pct < 5.0:
+                self.scan_label.setText(
+                    f'⚡ <b>ch{self.args.channel}</b> kept — best alternative ch{best} '
+                    f'is only {pct:.0f}% better (tie)')
+                return
         print(f'channel survey: best={best} span={span[0]}-{span[-1]} bytes={best_bytes} '
               f'rssi={best_rssi}; ranked={[(r[0], r[1]) for r in ranked[:5]]}', flush=True)
         if best != self.args.channel:
@@ -1114,7 +1141,11 @@ class Live(QWidget):
         return None
 
     # Measured-clean rate for each width at BW 40 (the knee minus ~10%; see NOTES.md).
-    PAIRED_RATE = {30: 1000, 114: 330, 166: 243, 0: 150}
+    # Rate presets as fractions of the live wire ceiling. Buttons, not a type box:
+    # the ceiling moves with SUB, BW and MODE, and a number typed for one config is
+    # a saturation accident waiting in another. MAX is 90% of ceiling -- the
+    # operating point every clean benchmark on this rig was measured at.
+    RATE_FRACTIONS = {'low': 0.25, 'mid': 0.50, 'high': 0.75, 'max': 0.90}
 
     def frame_width(self, sel=None):
         """Subcarriers per frame for a SUB selection, accounting for HT20's fallback:
@@ -1126,14 +1157,46 @@ class Live(QWidget):
         return {30: 30, 114: 114, 166: 166, 0: 192}[sel]
 
     def wire_ceiling(self, sel=None):
-        """The hard frame rate the UART can carry at this width: 921600 baud 8N1 is
-        92160 B/s, a v2 frame is 20 header + 2 bytes a subcarrier + 2 checksum."""
-        return int(92160 / (26 + 2 * self.frame_width(sel)))   # v3: 24 hdr + 2 sum
+        """The hard frame rate the wire can carry at this width and MODE. A pinned
+        receiver carries the full rate; in round-robin each receiver is silent while
+        it holds the token, so its wire carries only (n-1)/n of the total -- measured:
+        RATE 1600 round-robin on 2 boards sustains ~93% where pinned saturates at
+        1071. The firmware itself caps RATE at 2000."""
+        per_frame = 26 + 2 * self.frame_width(sel)             # v3: 24 hdr + 2 sum
+        ceil = 92160 / per_frame
+        if self.tx_sel == 'round-robin' and len(self.macs) > 1:
+            ceil *= len(self.macs) / (len(self.macs) - 1)
+        return min(int(ceil), 2000)
 
-    def safe_rate(self, sel=None):
-        sel = self.sub_sel if sel is None else sel
-        paired = self.PAIRED_RATE.get(sel, 0) if self.bw == 40 else 0
-        return min(paired, self.wire_ceiling(sel)) if paired else int(0.9 * self.wire_ceiling(sel))
+    def preset_hz(self, key):
+        return max(1, int(self.RATE_FRACTIONS[key] * self.wire_ceiling()))
+
+    def refresh_rate_buttons(self):
+        for key, b in self.rate_buttons.items():
+            b.setText(f'{key.upper()} {self.preset_hz(key)}')
+
+    def pick_rate_preset(self, key):
+        why = self.busy_reason()
+        if why:
+            self.rec_status.setText(f'<span style="color:#ff5555">{why}</span>')
+            self.rate_buttons[self.rate_preset].setChecked(True)
+            return
+        self.rate_preset = key
+        self.apply_rate_preset(announce=True)
+
+    def apply_rate_preset(self, announce=False):
+        """Re-resolve the active preset against the CURRENT ceiling and send it.
+        Called on every SUB/BW/mode change, so MAX means max-for-this-config,
+        always -- pinning a board that was at round-robin MAX would otherwise slam
+        one receiver's wire at ~170%."""
+        self.refresh_rate_buttons()
+        if self.rec is not None or self.proto is not None:
+            return                       # never retune mid-take
+        hz = self.preset_hz(self.rate_preset)
+        if self.send_rate(hz) and announce:
+            self.rec_status.setText(
+                f'rate → {hz} Hz ({self.rate_preset.upper()} · '
+                f'ceiling {self.wire_ceiling()} Hz here)')
 
     def send_rate(self, hz):
         ok = True
@@ -1144,7 +1207,6 @@ class Live(QWidget):
                 ok = False
         if ok:
             self.rate_val = hz
-            self.rate_edit.setText(str(hz))
         return ok
 
     def set_sub(self, n):
@@ -1169,37 +1231,11 @@ class Live(QWidget):
                 ok = False
         if ok:
             self.sub_sel = n
-            hz = self.safe_rate()
-            self.send_rate(hz)
+            self.apply_rate_preset()
             self.rec_status.setText(
-                f'subcarriers → {self.frame_width()} · rate auto-tuned to {hz} Hz '
-                f'(wire ceiling {self.wire_ceiling()} Hz at this width)')
+                f'subcarriers → {self.frame_width()} · rate → {self.rate_val} Hz '
+                f'({self.rate_preset.upper()} · ceiling {self.wire_ceiling()} Hz)')
             self.recalibrate()
-
-    def set_rate(self):
-        """Retune the ping rate on every board. Only the token holder pings, but the
-        token moves, so the rate must live on all of them."""
-        why = self.busy_reason()
-        if why:
-            self.rec_status.setText(f'<span style="color:#ff5555">{why}</span>')
-            self.rate_edit.setText(str(self.rate_val))
-            return
-        try:
-            hz = int(self.rate_edit.text().strip())
-        except ValueError:
-            hz = 0
-        if not 1 <= hz <= 2000:            # the firmware's own bounds
-            self.rate_edit.setText(str(self.rate_val))
-            return
-        ceil = self.wire_ceiling()
-        capped = min(hz, ceil)
-        if self.send_rate(capped):
-            msg = f'rate → {capped} Hz on all boards'
-            if capped < hz:
-                msg += (f' <span style="color:#ff9d3b">(asked {hz}, but the UART '
-                        f'physically carries {ceil} Hz at {self.frame_width()} '
-                        f'subcarriers — clamped)</span>')
-            self.rec_status.setText(msg)
 
     def toggle_bw(self):
         """Flip the whole rig between 20 and 40 MHz.
@@ -1224,6 +1260,7 @@ class Live(QWidget):
             return
         self.bw = want
         self.bw_btn.setText(f'BW: {want} MHz')
+        self.apply_rate_preset()
         # The subcarrier layout just changed: stale columns and a mean built on the
         # old width would both mislead, and the field split must be re-derived.
         self.recalibrate()
@@ -1241,6 +1278,7 @@ class Live(QWidget):
         self.amp_mean, self.fields = None, None
         self.fields_at = 0.0
         self.seen_min = self.seen_max = None
+        self.link_scale.clear()
 
     def set_channel(self, ch):
         """Move every board together. A board left behind hears nothing and shows up
@@ -1293,6 +1331,9 @@ class Live(QWidget):
         with self.lock:
             for k in self.buf:
                 self.buf[k].clear()
+        # The ceiling depends on the mode (a pinned receiver carries the full rate,
+        # round-robin receivers share it), so the preset re-resolves on every switch.
+        self.apply_rate_preset(announce=True)
 
     def issue(self, tx):
         """One board takes the token, everyone else listens for it."""
@@ -1509,10 +1550,12 @@ class Live(QWidget):
                         ref = newest if ref is None else ref + 0.02 * (newest - ref)
                         self.level_ref[key] = ref
                         seg = np.where(med > 0, seg * (ref / np.maximum(med, 1e-9)), seg)
-                # Hard absolute scale: the same colour is the same |CSI| in every
-                # panel and every session, so waterfalls are comparable at a glance.
-                span = max(self.wf_max - self.wf_min, 1e-6)
-                idx = np.clip((np.nan_to_num(seg) - self.wf_min) / span * 255,
+                # Fixed scale, per link once FIT has run: near and far links sit
+                # at very different levels, and each panel's colours span its own
+                # fitted bounds (or the global boxes before any fit).
+                slo, shi = self.link_scale.get(key, (self.wf_min, self.wf_max))
+                span = max(shi - slo, 1e-6)
+                idx = np.clip((np.nan_to_num(seg) - slo) / span * 255,
                               0, 255).astype(np.uint8)
                 rgba = np.zeros(seg.shape + (4,), np.uint8)
                 rgba[..., :3] = np.where(good[..., None], self.lut[idx], 0)
