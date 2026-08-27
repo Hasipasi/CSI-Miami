@@ -10,7 +10,9 @@ coordinate (top-left) and would train the model towards the corner of the image.
 One person is expected. When several are detected the highest-confidence box wins,
 and the runner-up's score is recorded so an ambiguous frame can be found later.
 
-Writes <session>/<take>_pose.npz beside the source capture.
+Writes <session>/<take>_pose.npz beside the source capture. The source camera
+timestamps and frame indices are copied into the pose archive, so every skeleton
+can be joined to CSI by the same integer nanosecond recording clock.
 
   .venv_pose/bin/python esp-csi/examples/get-started/tools/extract_poses.py --src data
 """
@@ -20,7 +22,9 @@ import glob
 import json
 import os
 import sys
+import tempfile
 import time
+import zipfile
 
 import numpy as np
 
@@ -33,7 +37,8 @@ COCO17 = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--src', default='data')
+    ap.add_argument('--src', nargs='+', default=['data'],
+                    help='capture file, session directory, or parent of sessions')
     ap.add_argument('--model', default='yolo11x-pose.pt')
     ap.add_argument('--imgsz', type=int, default=960)
     ap.add_argument('--batch', type=int, default=16)
@@ -44,20 +49,73 @@ def main():
     from ultralytics import YOLO
     model = YOLO(args.model)
 
-    dirs = sorted(glob.glob(f'{args.src}/*/*_frames'))
-    if not dirs:
-        sys.exit(f'no *_frames directories under {args.src}/')
-    print(f'{len(dirs)} takes, model {args.model} @ imgsz {args.imgsz}', flush=True)
+    dirs = []
+    archives = []
+    for src in args.src:
+        if os.path.isfile(src):
+            if src.endswith('.npz') and not src.endswith('_pose.npz'):
+                archives.append(src)
+            continue
+        # Accept either one session directory or a parent containing sessions.
+        dirs.extend(glob.glob(os.path.join(src, '*_frames')))
+        dirs.extend(glob.glob(os.path.join(src, '*', '*_frames')))
+        archives.extend(glob.glob(os.path.join(src, '*.npz')))
+        archives.extend(glob.glob(os.path.join(src, '*', '*.npz')))
+    dirs = sorted(set(dirs))
+    archives = sorted(set(archives))
+    sources = [('dir', d, d[:-len('_frames')]) for d in dirs]
+    legacy_bases = {base for _kind, _src, base in sources}
+    for archive in archives:
+        if archive.endswith('_pose.npz') or archive[:-4] in legacy_bases:
+            continue
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                has_frames = any(n.startswith('frames/') and n.endswith('.jpg')
+                                 for n in zf.namelist())
+        except zipfile.BadZipFile:
+            has_frames = False
+        if has_frames:
+            sources.append(('npz', archive, archive[:-4]))
+    if not sources:
+        sys.exit(f'no captures with video frames under {args.src}/')
+    print(f'{len(sources)} takes, model {args.model} @ imgsz {args.imgsz}', flush=True)
 
     t0 = time.time()
     tot_f = tot_found = 0
     worst = []
-    for n, fdir in enumerate(dirs, 1):
-        out = fdir[:-len('_frames')] + '_pose.npz'
+    for n, (kind, src, base) in enumerate(sources, 1):
+        out = base + '_pose.npz'
         if os.path.exists(out) and not args.overwrite:
             continue
+        tmp = None
+        if kind == 'npz':
+            tmp = tempfile.TemporaryDirectory(prefix='csi_frames_')
+            with zipfile.ZipFile(src) as zf:
+                for member in zf.namelist():
+                    if member.startswith('frames/') and member.endswith('.jpg'):
+                        zf.extract(member, tmp.name)
+            fdir = os.path.join(tmp.name, 'frames')
+        else:
+            fdir = src
         paths = sorted(glob.glob(os.path.join(fdir, '*.jpg')))
         F = len(paths)
+        capture = src if kind == 'npz' else base + '.npz'
+        with np.load(capture) as d:
+            source_meta = json.loads(str(d['meta'])) if 'meta' in d.files else {}
+            source_idx = (d['frame_idx'].astype(np.int64)
+                          if 'frame_idx' in d.files else np.arange(len(d['frame_t'])))
+            image_idx = np.array([int(os.path.splitext(os.path.basename(p))[0])
+                                  for p in paths], dtype=np.int64)
+            lookup = {int(idx): pos for pos, idx in enumerate(source_idx)}
+            try:
+                take = np.array([lookup[int(idx)] for idx in image_idx], dtype=np.int64)
+            except KeyError as e:
+                raise ValueError(f'{capture}: image frame {e.args[0]} has no timestamp')
+            timing = {}
+            for key in ('frame_t', 'frame_t_ns', 'frame_epoch', 'frame_seq'):
+                if key in d.files:
+                    timing[key] = d[key][take]
+            timing['frame_idx'] = image_idx
         kp = np.full((F, 17, 3), np.nan, dtype=np.float32)
         box = np.full((F, 4), np.nan, dtype=np.float32)
         conf = np.zeros(F, dtype=np.float32)
@@ -84,23 +142,33 @@ def main():
                 i += 1
 
         found = np.isfinite(kp[:, 0, 0])
-        np.savez_compressed(
-            out, keypoints=kp, bbox=box, det_conf=conf, second_conf=second,
-            n_persons=npers, found=found,
-            meta=np.array(json.dumps(dict(
+        pose_meta = dict(
                 model=args.model, imgsz=args.imgsz, layout='COCO-17',
                 keypoint_names=COCO17, image_size=[1280, 720],
                 coords='pixels, [x, y, keypoint_confidence]; NaN where no person',
-                selection='highest-confidence box per frame'))))
+                selection='highest-confidence box per frame',
+                source_capture=os.path.basename(capture),
+                timestamp_origin=source_meta.get('timestamp_origin', 'record_start'),
+                timestamp_unit=source_meta.get('timestamp_unit', 'nanoseconds'))
+        tmp_out = out + '.tmp'
+        with open(tmp_out, 'wb') as fh:
+            np.savez_compressed(
+                fh, keypoints=kp, bbox=box, det_conf=conf, second_conf=second,
+                n_persons=npers, found=found, meta=np.array(json.dumps(pose_meta)),
+                **timing)
+        os.replace(tmp_out, out)
+        if tmp is not None:
+            tmp.cleanup()
         tot_f += F
         tot_found += int(found.sum())
         rate = found.mean()
         if rate < 0.98:
             worst.append((os.path.basename(out)[:-9], rate, F))
-        if n % 25 == 0 or n == len(dirs):
-            el = time.time() - t0
-            print(f'  {n}/{len(dirs)} takes  {tot_f} frames  '
-                  f'{el:.0f}s  ({tot_f / max(el, 1e-9):.0f} fps)', flush=True)
+        el = time.time() - t0
+        done_rate = tot_f / max(el, 1e-9)
+        eta = ((len(sources) - n) * (el / n)) if n else 0.0
+        print(f'  {n}/{len(sources)} takes  {tot_f} frames  '
+              f'{el:.0f}s  ({done_rate:.1f} fps, ETA {eta / 60:.1f} min)', flush=True)
 
     print(f'\n{tot_f} frames, person found in {tot_found} '
           f'({100 * tot_found / max(tot_f, 1):.2f}%)')

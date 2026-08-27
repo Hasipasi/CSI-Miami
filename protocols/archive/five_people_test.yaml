@@ -1,0 +1,26 @@
+# Five-person free-activity TEST capture.
+#
+# Run this after the train protocol. It writes one self-contained recording per
+# participant under data/five_people_test/. Keep participant numbers identical to
+# the train session. Each recording lasts three minutes; the 20-second gap is for
+# changing participants.
+
+lead_in: 10
+duration: 180
+gap: 20
+
+takes:
+  - name: participant-01
+    instruction: PARTICIPANT 1 — TEST — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES
+
+  - name: participant-02
+    instruction: PARTICIPANT 2 — TEST — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES
+
+  - name: participant-03
+    instruction: PARTICIPANT 3 — TEST — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES
+
+  - name: participant-04
+    instruction: PARTICIPANT 4 — TEST — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES
+
+  - name: participant-05
+    instruction: PARTICIPANT 5 — TEST — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES

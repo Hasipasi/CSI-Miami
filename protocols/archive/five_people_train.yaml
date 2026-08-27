@@ -1,0 +1,30 @@
+# Five-person free-activity TRAIN capture.
+#
+# Run this protocol once. It writes one self-contained recording per participant:
+#   data/five_people_train/participant-01.npz
+#   ...
+#   data/five_people_train/participant-05.npz
+#
+# Each recording contains five minutes of raw CSI and timestamp-matched camera
+# frames. The cue window shows the participant number, take progress, and MM:SS
+# remaining. The 20-second gap is for changing participants.
+
+lead_in: 10
+duration: 300
+gap: 20
+
+takes:
+  - name: participant-01
+    instruction: PARTICIPANT 1 — TRAIN — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES
+
+  - name: participant-02
+    instruction: PARTICIPANT 2 — TRAIN — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES
+
+  - name: participant-03
+    instruction: PARTICIPANT 3 — TRAIN — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES
+
+  - name: participant-04
+    instruction: PARTICIPANT 4 — TRAIN — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES
+
+  - name: participant-05
+    instruction: PARTICIPANT 5 — TRAIN — MOVE NATURALLY AND DO VARIED EVERYDAY ACTIVITIES

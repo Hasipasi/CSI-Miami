@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import sys
+import zipfile
 
 import numpy as np
 
@@ -42,10 +43,15 @@ def check(path):
     dur = float(ft[-1] - ft[0]) if len(ft) > 1 else 0.0
     fps = len(ft) / dur if dur > 0 else 0.0
 
-    # frames on disk must match the index, or frame k in the npz is not the image
-    # sitting at 000k.jpg and every label lines up with the wrong picture
+    # Frames are embedded in new captures and live in a sibling directory in legacy
+    # captures. Either way, frame k must resolve to its zero-padded JPEG name.
     fdir = os.path.join(os.path.dirname(path), f'{name}_frames')
-    njpg = len(glob.glob(os.path.join(fdir, '*.jpg')))
+    if os.path.isdir(fdir):
+        njpg = len(glob.glob(os.path.join(fdir, '*.jpg')))
+    else:
+        with zipfile.ZipFile(path) as zf:
+            njpg = sum(n.startswith('frames/') and n.endswith('.jpg')
+                       for n in zf.namelist())
     if njpg != len(ft):
         probs.append(f'{len(ft)} frame timestamps but {njpg} jpgs on disk')
     if meta.get('dropped_encode'):

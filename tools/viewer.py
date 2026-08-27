@@ -21,15 +21,11 @@ would be denser and wrong: consecutive columns would then be different physical
 links depending on who held the token, so a handoff would read as a channel
 change. TX down the rows, RX across the columns.
 
-Each packet is normalised before display: a z-score per column, computed separately
-within each of the three 64-wide CSI fields and ignoring the dead guard-band
-subcarriers. That strips the packet's overall level -- AGC, distance, per-board
-gain -- and leaves the frequency-selective shape the body actually modulates, and it
-makes a quiet link as readable as a loud one. Scaling all 192 together instead just
-encodes which field a subcarrier is in: their gains differ about fivefold. The colour range is then fixed in sigma
-units, never fitted to the current frame: a scale that rescales itself makes a
-quiet moment look identical to a loud one. **This is display only; every recording
-stores raw amplitudes.**
+The display is raw by default. Floor can capture the current empty-room response for
+each link and flatten its frequency profile from then on; the reference stays fixed
+until X is pressed or Floor captures it again. The lower Norm toggle separately removes each
+packet's common-mode level bounce. **Both treatments are display only; every
+recording stores raw amplitudes.**
 
 The radio is driven from here too. Both this and the role commands need the same
 serial port, and two processes cannot own it at once.
@@ -75,6 +71,22 @@ from capture import (SUB_INDEX, CsiStream, JpegWriter, LABEL,
                             write_capture)
 
 pg.setConfigOptions(imageAxisOrder='row-major')
+
+
+_QPushButton = QPushButton
+
+
+class QPushButton(_QPushButton):
+    """Reserve room for the bold checked state used by every selector."""
+
+    def sizeHint(self):
+        size = super().sizeHint()
+        size.setWidth((size.width() * 105 + 99) // 100)
+        return size
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
+
 
 NPKT = 20             # columns on screen: the last 20 packets, one packet each
 # ESP32 HT40 CSI is three 64-wide fields (LLTF | HT-LTF | STBC-HT-LTF) whose gains
@@ -126,18 +138,22 @@ class StatTile(QFrame):
     """One number with a small caption. The GUI's job is these numbers; prose about
     what they mean lives in the README."""
 
+    clicked = QtCore.pyqtSignal()
+
     def __init__(self, caption):
         super().__init__()
         self.setStyleSheet(
             'QFrame { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, '
             f'stop:0 #1e222c, stop:1 {PANEL}); '
             f'border: 1px solid {BORDER}; border-radius: 11px; }}')
-        self.setMinimumWidth(112)
+        self.setMinimumWidth(88)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 8, 14, 8)
         lay.setSpacing(1)
         self.val = QLabel('—')
         self.cap = QLabel(caption.upper())
+        self.val.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.cap.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
         self.cap.setStyleSheet(
             f'font-size: 9px; letter-spacing: 1px; color: {MUTED}; '
             'background: transparent; border: none;')
@@ -150,6 +166,77 @@ class StatTile(QFrame):
         self.val.setStyleSheet(f'font-size: 24px; font-weight: bold; '
                                f'color: {color or INK}; background: transparent; '
                                'border: none;')
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(ev)
+
+
+class FlowLayout(QLayout):
+    """A compact left-to-right layout that wraps widgets as its width changes."""
+
+    def __init__(self, parent=None, margin=0, spacing=7):
+        super().__init__(parent)
+        self.items = []
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self.items.append(item)
+
+    def count(self):
+        return len(self.items)
+
+    def itemAt(self, index):
+        return self.items[index] if 0 <= index < len(self.items) else None
+
+    def takeAt(self, index):
+        return self.items.pop(index) if 0 <= index < len(self.items) else None
+
+    def expandingDirections(self):
+        return QtCore.Qt.Orientations(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self.items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(),
+                            margins.top() + margins.bottom())
+
+    def _layout(self, rect, test_only):
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(),
+                             -margins.right(), -margins.bottom())
+        x, y, line_height = area.x(), area.y(), 0
+        spacing = self.spacing()
+        for item in self.items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + spacing
+            if line_height and next_x - spacing > area.right() + 1:
+                x = area.x()
+                y += line_height + spacing
+                next_x = x + hint.width() + spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + margins.bottom()
 
 
 GOOD, WARN, BAD = '#34d399', '#fbbf24', '#f87171'
@@ -242,7 +329,13 @@ class Cue(QWidget):
         self.set_phase(phase)
         self.step.setText(step)
         self.head.setText(head)
-        self.count.setText('' if secs is None else str(int(np.ceil(max(secs, 0)))))
+        if secs is None:
+            countdown = ''
+        else:
+            remaining = int(np.ceil(max(secs, 0)))
+            countdown = (f'{remaining // 60}:{remaining % 60:02d}'
+                         if remaining >= 60 else str(remaining))
+        self.count.setText(countdown)
         self.sub.setText(sub)
 
 
@@ -301,6 +394,13 @@ class Live(QWidget):
         # re-anchors to the link's running level: the bounce goes, the shape stays.
         self.level_lock = False
         self.level_ref = {}
+        # Empty-room frequency-response equalisation. Each per-link vector is a
+        # multiplier captured from the current visible packets: applying it makes
+        # the captured profile horizontal while preserving that link's typical
+        # amplitude, so the existing absolute plot bounds remain useful. NaNs mark
+        # dead/null carriers which cannot be divided safely.
+        self.profile_norm = False
+        self.norm_scale = {}
         # Running mean level per subcarrier, and the field split derived from it.
         # Measured rather than tabulated because the tabulated layout is wrong (see
         # derive_fields), and because it has to survive a bandwidth change at runtime.
@@ -309,7 +409,7 @@ class Live(QWidget):
         self.fields_at = 0.0
         self.scan = None           # channel survey state, None when not scanning
         self.bw = args.bw          # what the boards are believed to be running
-        self.sub_sel = 166         # firmware boot default (CONFIG_SUB_COUNT)
+        self.sub_sel = 30          # GUI startup setting, applied to every board below
         self.rate_val = 243        # firmware boot default (CONFIG_SEND_FREQUENCY)
         # CLOCK_MONOTONIC to wall clock, measured once: the two drift far too slowly
         # to matter across a run, and re-measuring per frame would inject exactly the
@@ -338,6 +438,22 @@ class Live(QWidget):
             QLineEdit {{ padding: 7px 9px; background: {PANEL}; color: {INK};
                          border: 1px solid {BORDER}; border-radius: 9px; }}
             QLineEdit:focus {{ border-color: {ACCENT}; }}
+            QGroupBox {{ border: 1px solid {BORDER}; border-radius: 11px;
+                         margin-top: 12px; padding: 10px 8px 8px 8px; }}
+            QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px;
+                                font-size: 10px; font-weight: bold; letter-spacing: 1px; }}
+            QGroupBox#recordingSetup {{ border-color: #75552b; }}
+            QGroupBox#recordingSetup::title {{ color: {WARN}; }}
+            QGroupBox#displayOnly {{ border-color: #245d63; }}
+            QGroupBox#displayOnly::title {{ color: #67e8f9; }}
+            QGroupBox#captureControls {{ border-color: #315c99; }}
+            QGroupBox#captureControls::title {{ color: #93c5fd; }}
+            QTabWidget::pane {{ border: none; }}
+            QTabBar::tab {{ padding: 6px 14px; color: {MUTED}; background: {PANEL};
+                            border: 1px solid {BORDER}; border-bottom: none;
+                            border-top-left-radius: 8px; border-top-right-radius: 8px; }}
+            QTabBar::tab:selected {{ color: white; background: {ACCENT};
+                                     border-color: {ACCENT}; font-weight: bold; }}
         ''')
         root = QHBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -345,36 +461,56 @@ class Live(QWidget):
 
         # ---- camera ----
         left = QVBoxLayout()
+        # Live health belongs with the camera overview rather than the radio controls.
+        self.tiles = {}
+        tile_rows = (
+            (('rate', 'per-link rate'), ('gap', 'gap p99'),
+             ('drops', 'drops (board·host)')),
+            (('deliv', 'delivery'), ('loss', 'radio loss'), ('wire', 'wire util')),
+        )
+        for specs in tile_rows:
+            strip = QHBoxLayout()
+            for key, caption in specs:
+                t = StatTile(caption)
+                strip.addWidget(t, 1)
+                self.tiles[key] = t
+            left.addLayout(strip)
+        self.tiles_at = 0.0
+        self.board_stats = {}       # rx mac -> parsed STATS counters
+        self.link_health = {}       # directed link -> (one-second Hz, loss or None)
+        self.drop_board_base = {}
+        self.drop_host_base = 0
+        self.tiles['drops'].setCursor(QtCore.Qt.PointingHandCursor)
+        self.tiles['drops'].setToolTip('Click to reset the displayed drop counters')
+        self.tiles['drops'].clicked.connect(self.reset_drop_stats)
+
         self.cam_label = QLabel(alignment=QtCore.Qt.AlignCenter)
         self.cam_label.setMinimumWidth(360)   # the video scales; the layout decides
+        self.cam_fps = QLabel('—', self.cam_label)
+        self.cam_fps.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.cam_fps.setStyleSheet(
+            f'font-size: 17px; font-weight: bold; color: {INK}; '
+            'background-color: rgba(16, 18, 24, 185); '
+            'border: 1px solid rgba(255, 255, 255, 35); border-radius: 7px; '
+            'padding: 4px 8px;')
         cap = QLabel(f'{cam.name} · {cam.w}x{cam.h} @ {cam.fps:g} fps')
         cap.setStyleSheet(f'color: {MUTED}; font-size: 13px;')
         left.addWidget(cap)
         left.addWidget(self.cam_label, 1)
 
-        root.addLayout(left, 3)
+        root.addLayout(left, 1)
 
         # ---- CSI grid ----
         right = QVBoxLayout()
-        # Numbers, not prose: live health of the rig in one row.
-        strip = QHBoxLayout()
-        self.tiles = {}
-        for key, caption in (('rate', 'per-link rate'), ('deliv', 'delivery'),
-                             ('loss', 'radio loss'), ('gap', 'gap p99'),
-                             ('wire', 'wire util'), ('drops', 'drops (board·host)'),
-                             ('cam', 'camera')):
-            t = StatTile(caption)
-            strip.addWidget(t)
-            self.tiles[key] = t
-        strip.addStretch(1)
-        right.addLayout(strip)
-        self.tiles_at = 0.0
-        self.board_stats = {}       # rx mac -> parsed STATS counters
+        control_tabs = QTabWidget()
+        self.control_tabs = control_tabs
+        setup_box = QGroupBox()
+        setup_box.setObjectName('recordingSetup')
+        setup_layout = FlowLayout(setup_box, margin=8)
 
         # ---- who transmits: round-robin, or one board pinned ----
         self.by_label = {LABEL.get(m[-5:], m): m for m in self.macs}
-        bar = QHBoxLayout()
-        bar.addWidget(QLabel('TX'))
+        setup_layout.addWidget(QLabel('TX'))
         self.tx_buttons = {}
         group = QButtonGroup(self)
         group.setExclusive(True)
@@ -383,132 +519,181 @@ class Live(QWidget):
             b.setCheckable(True)
             b.clicked.connect(lambda _c, n=name: self.set_tx(n))
             group.addButton(b)
-            bar.addWidget(b)
+            setup_layout.addWidget(b)
             self.tx_buttons[name] = b
-        bar.addSpacing(20)
-        self.csi_btn = QPushButton('■ STOP CSI')
-        self.csi_btn.setMinimumWidth(140)
-        self.csi_btn.clicked.connect(self.toggle_csi)
-        bar.addWidget(self.csi_btn)
-        self.scan_btn = QPushButton('⚡ FIND BEST CHANNEL')
-        self.scan_btn.setMinimumWidth(190)
-        self.scan_btn.clicked.connect(self.start_scan)
-        bar.addWidget(self.scan_btn)
-        self.bw_btn = QPushButton('')
-        self.bw_btn.setMinimumWidth(120)
-        self.bw_btn.clicked.connect(self.toggle_bw)
-        self.bw_btn.setText(f'BW: {self.bw} MHz')
-        bar.addWidget(self.bw_btn)
-        bar.addStretch(1)
-        right.addLayout(bar)
+        setup_layout.addWidget(QLabel('Hz'))
+        self.rate_buttons = {}
+        rate_group = QButtonGroup(self)
+        rate_group.setExclusive(True)
+        for hz in (300, 600, 900):
+            b = QPushButton(str(hz))
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c, rate=hz: self.pick_rate_preset(rate))
+            rate_group.addButton(b)
+            setup_layout.addWidget(b)
+            self.rate_buttons[hz] = b
+        self.rate_preset = 300
+        self.rate_buttons[300].setChecked(True)
 
-        # ---- radio detail: subcarrier count and ping rate ----
-        # One row because they are one decision: the UART carries ~92 KB/s, so the
-        # frame size (set by SUB) fixes the highest rate that fits. The hint shows the
-        # measured-clean pairing for each width so the coupling is visible where the
-        # buttons are, not just in the README.
-        radio_bar = QHBoxLayout()
-        radio_bar.addWidget(QLabel('SUB'))
+        self.csi_btn = QPushButton('■ STOP CSI')
+        self.csi_btn.setMinimumWidth(147)
+        self.csi_btn.clicked.connect(self.toggle_csi)
+        setup_layout.addWidget(self.csi_btn)
+        setup_layout.addWidget(QLabel('SUB'))
         self.sub_buttons = {}
         sub_group = QButtonGroup(self)
         sub_group.setExclusive(True)
-        for n, label in ((30, '30'), (114, '114'), (166, '166'), (0, '192 (all)')):
+        for n, label in ((30, '30'), (114, '114'), (166, '166')):
             b = QPushButton(label)
             b.setCheckable(True)
             b.clicked.connect(lambda _c, k=n: self.set_sub(k))
             sub_group.addButton(b)
-            radio_bar.addWidget(b)
+            setup_layout.addWidget(b)
             self.sub_buttons[n] = b
-        self.sub_buttons[166].setChecked(True)
-        radio_bar.addSpacing(16)
-        radio_bar.addWidget(QLabel('Hz'))
-        self.rate_buttons = {}
-        rate_group = QButtonGroup(self)
-        rate_group.setExclusive(True)
-        for key in ('low', 'mid', 'high', 'max'):
-            b = QPushButton('')
+        self.sub_buttons[30].setChecked(True)
+        self.scan_btn = QPushButton('⚡ FIND BEST CHANNEL')
+        self.scan_btn.setMinimumWidth(200)
+        self.scan_btn.clicked.connect(self.start_scan)
+        self.scan_result_timer = QtCore.QTimer(self)
+        self.scan_result_timer.setSingleShot(True)
+        self.scan_result_timer.timeout.connect(self.reset_scan_button)
+        setup_layout.addWidget(self.scan_btn)
+        setup_layout.addWidget(QLabel('BW'))
+        self.bw_buttons = {}
+        bw_group = QButtonGroup(self)
+        bw_group.setExclusive(True)
+        for mhz in (20, 40):
+            b = QPushButton(str(mhz))
             b.setCheckable(True)
-            b.clicked.connect(lambda _c, k=key: self.pick_rate_preset(k))
-            rate_group.addButton(b)
-            radio_bar.addWidget(b)
-            self.rate_buttons[key] = b
-        # Boot RATE 243 sits nearest 50% of the boot config's ceiling; labels are
-        # filled in once tx_sel exists (refresh_rate_buttons at init tail).
-        self.rate_preset = 'mid'
-        self.rate_buttons['mid'].setChecked(True)
-        self.view_btn = QPushButton('View: spectrum')
-        self.view_btn.clicked.connect(self.toggle_view)
-        radio_bar.addWidget(self.view_btn)
-        self.lock_btn = QPushButton('Plot: raw')
+            b.clicked.connect(lambda _c, width=mhz: self.set_bw(width))
+            bw_group.addButton(b)
+            setup_layout.addWidget(b)
+            self.bw_buttons[mhz] = b
+        self.bw_buttons[self.bw].setChecked(True)
+        control_tabs.addTab(setup_box, 'CSI')
+
+        # ---- display-only controls ----
+        display_box = QGroupBox()
+        display_box.setObjectName('displayOnly')
+        visual_flow = FlowLayout(display_box, margin=8)
+        floor_control = QWidget()
+        floor_control.setFixedSize(131, 36)
+        self.norm_btn = QPushButton('Floor', floor_control)
+        self.norm_btn.setFixedSize(80, 36)
+        self.norm_btn.move(51, 0)
+        self.norm_btn.setCheckable(True)
+        self.norm_btn.setToolTip(
+            'Capture a new per-link empty-room floor for the display. '
+            'Recordings always stay raw.')
+        self.norm_btn.clicked.connect(self.capture_profile_norm)
+        self.norm_off_btn = QPushButton('X', floor_control)
+        self.norm_off_btn.setFixedSize(28, 14)
+        self.norm_off_btn.move(103, 0)
+        self.norm_off_btn.setStyleSheet(
+            'QPushButton { padding: 0; font-size: 10px; font-weight: bold; '
+            'color: white; background: #991b2f; border: 1px solid #e05268; '
+            'border-radius: 7px; }'
+            'QPushButton:hover { background: #be2440; border-color: #fb7185; }'
+            'QPushButton:pressed { background: #701326; }'
+            'QPushButton:disabled { color: #606572; background: #22252e; '
+            'border-color: #353946; }')
+        self.norm_off_btn.setEnabled(False)
+        self.norm_off_btn.setToolTip(
+            'Turn off empty-room normalization and return to the raw display.')
+        self.norm_off_btn.clicked.connect(self.disable_profile_norm)
+        self.norm_off_btn.raise_()
+        visual_flow.addWidget(floor_control)
+        visual_flow.addWidget(QLabel('VIEW'))
+        self.view_buttons = {}
+        view_group = QButtonGroup(self)
+        view_group.setExclusive(True)
+        for mode in ('spectrum', 'waterfall'):
+            b = QPushButton(mode)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c, selected=mode: self.set_view(selected))
+            view_group.addButton(b)
+            visual_flow.addWidget(b)
+            self.view_buttons[mode] = b
+        self.view_buttons[self.view_mode].setChecked(True)
+        self.lock_btn = QPushButton('Norm')
+        self.lock_btn.setCheckable(True)
+        self.lock_btn.setToolTip(
+            'Toggle per-packet level locking for the display only. '
+            'Recordings always stay raw.')
         self.lock_btn.clicked.connect(self.toggle_level_lock)
-        radio_bar.addWidget(self.lock_btn)
-        radio_bar.addSpacing(16)
+        visual_flow.addWidget(self.lock_btn)
+        visual_flow.addWidget(QLabel('PLOT RANGE'))
         self.wfmin_edit = QLineEdit(f'{self.wf_min:g}')
         self.wfmin_edit.setFixedWidth(84)
         self.wfmin_edit.returnPressed.connect(self.set_wf_scale)
-        radio_bar.addWidget(self.wfmin_edit)
+        visual_flow.addWidget(self.wfmin_edit)
         self.wfmax_edit = QLineEdit(f'{self.wf_max:g}')
         self.wfmax_edit.setFixedWidth(84)
         self.wfmax_edit.returnPressed.connect(self.set_wf_scale)
-        radio_bar.addWidget(self.wfmax_edit)
+        visual_flow.addWidget(self.wfmax_edit)
         fit = QPushButton('FIT')
-        fit.setMaximumWidth(50)
+        fit.setMaximumWidth(53)
+        fit.setToolTip('Fit per-link display ranges. Recordings always stay raw.')
         fit.clicked.connect(self.fit_wf_scale)
-        radio_bar.addWidget(fit)
+        visual_flow.addWidget(fit)
         self.seen_label = QLabel('')
         self.seen_label.setStyleSheet(f'color: {MUTED}; font-size: 11px;')
-        radio_bar.addWidget(self.seen_label)
-        radio_bar.addStretch(1)
-        right.addLayout(radio_bar)
+        visual_flow.addWidget(self.seen_label)
+        control_tabs.addTab(display_box, 'VIZ')
 
         self.role = QLabel('')
         self.role.setStyleSheet(f'color: {INK}; font-size: 14px;')
-        right.addWidget(self.role)
         self.scan_label = QLabel('')
         self.scan_label.setStyleSheet(
             f'color: {MUTED}; font-size: 12px; font-family: Menlo, monospace;')
         self.scan_label.setWordWrap(True)
-        right.addWidget(self.scan_label)
 
         # ---- capture ----
         self.rec = None            # None when idle; a dict of state while recording
         self.proto = None          # scripted protocol state, None when not running
         self.cue = None
-        cap_bar = QHBoxLayout()
+        self.proto_label = QLabel('')
+        self.proto_label.setStyleSheet(f'color: {MUTED}; font-size: 12px;')
+        self.proto_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        capture_box = QGroupBox()
+        capture_box.setObjectName('captureControls')
+        cap_bar = FlowLayout(capture_box, margin=8)
 
         self.prefix_edit = QLineEdit(args.prefix)
         self.prefix_edit.setMinimumWidth(160)
         cap_bar.addWidget(self.prefix_edit)
         self.rec_btn = QPushButton('● REC')
-        self.rec_btn.setMinimumWidth(130)
+        self.rec_btn.setMinimumWidth(137)
         self.rec_btn.clicked.connect(self.toggle_record)
         cap_bar.addWidget(self.rec_btn)
         self.proto_btn = QPushButton('▶ RUN PROTOCOL')
         self.proto_btn.clicked.connect(self.toggle_protocol)
         self.proto_btn.setEnabled(bool(args.protocol))
         cap_bar.addWidget(self.proto_btn)
+        cap_bar.addWidget(self.proto_label)
         pick = QPushButton('Protocol…')
         pick.clicked.connect(self.pick_protocol)
         cap_bar.addWidget(pick)
-        cap_bar.addStretch(1)
-        right.addLayout(cap_bar)
+        control_tabs.addTab(capture_box, 'REC')
         self.style_rec_button()
 
         self.rec_status = QLabel('')
-        self.proto_label = QLabel('')
-        self.proto_label.setStyleSheet(f'color: {MUTED}; font-size: 12px;')
         self.rec_status.setStyleSheet(f'color: {MUTED}; font-size: 13px;')
         self.health = QLabel('')
         self.health.setStyleSheet('font-size: 14px; font-weight: bold;')
         self.health.setWordWrap(True)
+        right.addWidget(control_tabs)
         right.addWidget(self.health)
-        right.addWidget(self.proto_label)
         right.addWidget(self.rec_status)
         self.show_protocol()
+        control_tabs.currentChanged.connect(self.resize_control_tabs)
 
         self.grid = QGridLayout()
         self.grid.setSpacing(10)
-        right.addLayout(self.grid, 1)
+        self.grid_host = QWidget()
+        self.grid_host.setLayout(self.grid)
+        self.grid_host.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right.addWidget(self.grid_host, 1)
         root.addLayout(right, 2)
 
         self.panels = {}
@@ -523,7 +708,8 @@ class Live(QWidget):
         start = args.tx if args.tx in self.by_label else 'round-robin'
         self.tx_sel = start
         self.tx_buttons[start].setChecked(True)
-        self.refresh_rate_buttons()
+        self.arrange_panels()
+        self.set_sub(self.sub_sel)
         self.style_csi_button()
 
         for m in self.macs:
@@ -536,6 +722,8 @@ class Live(QWidget):
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.on_tick)
         self.timer.start(int(1000 / args.refresh))
+        QtCore.QTimer.singleShot(0, self.resize_csi_grid)
+        QtCore.QTimer.singleShot(0, self.resize_control_tabs)
 
     def current_fields(self):
         """The field split to normalise and draw by: measured if enough packets have
@@ -543,6 +731,28 @@ class Live(QWidget):
         if self.fields:
             return self.fields
         return field_bounds(self.n_sub) if self.n_sub else [(0, 1)]
+
+    def resize_csi_grid(self):
+        """Let the plot grid fill all space left by the responsive control tab."""
+        self.grid_host.setMaximumHeight(16777215)
+
+    def resize_control_tabs(self):
+        """Match the tab frame to the active responsive control layout."""
+        page = self.control_tabs.currentWidget()
+        if page is None:
+            return
+        content_width = max(self.control_tabs.width() - 4, 1)
+        content_height = page.heightForWidth(content_width)
+        if content_height < 0:
+            content_height = page.sizeHint().height()
+        self.control_tabs.setFixedHeight(
+            self.control_tabs.tabBar().sizeHint().height() + content_height + 4)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'grid_host'):
+            self.resize_csi_grid()
+            self.resize_control_tabs()
 
     NTRAIL = 9        # newest packet bold, eight ghosts behind it
     def set_wf_scale(self):
@@ -561,7 +771,7 @@ class Live(QWidget):
         self.wfmin_edit.setText(f'{lo:g}')
         self.wfmax_edit.setText(f'{hi:g}')
 
-    def fit_wf_scale(self):
+    def fit_wf_scale(self, _checked=False):
         """Snap the fixed colour bounds to the range actually seen. The signal here
         sits around a third of the way up a 0-150 scale, so its ~10% flutter spans
         about two colour steps -- which is why a wide fixed scale reads as "not
@@ -570,10 +780,21 @@ class Live(QWidget):
         # Per LINK, from the CURRENT buffers: each panel gets bounds hugged to its
         # own signal, so a 3 m link and a 4.2 m diagonal are both readable at once.
         with self.lock:
-            snap = {k: [it[2] for it in v] for k, v in self.buf.items() if len(v) > 3}
+            snap = {
+                k: [it[2] for it in list(v)[-NPKT:]]
+                for k, v in self.buf.items() if len(v) > 3
+            }
         n = 0
         for k, vals in snap.items():
-            A = np.concatenate(vals)
+            width = len(vals[-1])
+            vals = [v for v in vals if len(v) == width]
+            if not vals:
+                continue
+            A = np.stack(vals, axis=1)
+            A = self.normalised_signal(k, A)
+            A = A[np.isfinite(A)]
+            if not A.size:
+                continue
             lo, hi = float(np.floor(A.min())), float(np.ceil(A.max()))
             if hi <= lo:
                 hi = lo + 1
@@ -581,18 +802,92 @@ class Live(QWidget):
             n += 1
         if n:
             self.rec_status.setText(f'scale fitted per link ({n} links)')
+        return n
 
-    def toggle_level_lock(self):
+    def capture_profile_norm(self, _checked=False):
+        """Capture fixed empty-room frequency-response equalisation.
+
+        The median of the visible packet window is robust to an occasional noisy
+        packet. Every live subcarrier is scaled to that profile's median level, so
+        the room response becomes a horizontal line without moving the plot to an
+        unfamiliar 0/1 scale. Dead carriers are left as gaps instead of amplifying
+        their near-zero noise. This only touches values on their way to the plots.
+        """
+        with self.lock:
+            snap = {
+                k: [it[2].copy() for it in list(v)[-NPKT:]]
+                for k, v in self.buf.items() if len(v) > 3
+            }
+        scales = {}
+        for key, vals in snap.items():
+            n = len(vals[-1])
+            vals = [v for v in vals if len(v) == n]
+            if len(vals) < 4:
+                continue
+            profile = np.median(np.stack(vals), axis=0).astype(np.float64)
+            positive = profile[np.isfinite(profile) & (profile > 0)]
+            if not positive.size:
+                continue
+            floor = 0.05 * float(np.median(positive))
+            valid = np.isfinite(profile) & (profile > max(floor, 1e-9))
+            if not valid.any():
+                continue
+            level = float(np.median(profile[valid]))
+            scale = np.full(profile.shape, np.nan, dtype=np.float64)
+            scale[valid] = level / profile[valid]
+            scales[key] = scale
+
+        if not scales:
+            # A failed recapture must not turn off a floor that was already active.
+            self.norm_btn.setChecked(self.profile_norm)
+            self.rec_status.setText(
+                '<span style="color:#ff5555">Floor needs at least four current '
+                'packets on a link</span>')
+            return
+
+        self.norm_scale = scales
+        self.profile_norm = True
+        self.level_ref.clear()
+        # Floor is a recapture button, not a conventional toggle: clicking an
+        # already-blue button captures again and must leave it blue.
+        self.norm_btn.setChecked(True)
+        self.norm_off_btn.setEnabled(True)
+        fitted = self.fit_wf_scale()
+        self.rec_status.setText(
+            f'empty-room floor captured ({len(scales)} links) · '
+            f'scale fitted ({fitted} links) · display only')
+
+    def disable_profile_norm(self, _checked=False, announce=True):
+        """Turn off display normalization; the captured reference is discarded."""
+        self.profile_norm = False
+        self.norm_scale.clear()
+        self.level_ref.clear()
+        self.norm_btn.setChecked(False)
+        self.norm_off_btn.setEnabled(False)
+        if announce:
+            self.rec_status.setText('empty-room floor off')
+
+    def normalised_signal(self, key, values):
+        """Return display values with the captured frequency profile removed."""
+        scale = self.norm_scale.get(key) if self.profile_norm else None
+        a = np.asarray(values)
+        if scale is None or not a.ndim or a.shape[0] != len(scale):
+            return a
+        if a.ndim == 1:
+            return a * scale
+        return a * scale[:, None]
+
+    def toggle_level_lock(self, checked):
         """raw: exactly what the boards deliver and the recording stores. norm: the
         postprocessed view -- per-packet level normalisation, the same treatment a
         model's preprocessing applies, so the plots show what training data will
         look like. Display only in both positions."""
-        self.level_lock = not self.level_lock
-        self.lock_btn.setText('Plot: norm' if self.level_lock else 'Plot: raw')
+        self.level_lock = checked
 
-    def toggle_view(self):
-        self.view_mode = 'waterfall' if self.view_mode == 'spectrum' else 'spectrum'
-        self.view_btn.setText(f'View: {self.view_mode}')
+    def set_view(self, mode):
+        if mode == self.view_mode:
+            return
+        self.view_mode = mode
         self._panel_fields = None            # force a rebuild on the next tick
 
     @staticmethod
@@ -645,7 +940,9 @@ class Live(QWidget):
 
         if self.level_lock:
             ref = self.level_ref.get(key)
-            med = float(np.median(items[-1][2])) or 1.0
+            newest = self.normalised_signal(key, items[-1][2])
+            med = float(np.nanmedian(newest))
+            med = med if np.isfinite(med) and med > 0 else 1.0
             ref = med if ref is None else ref + 0.02 * (med - ref)
             self.level_ref[key] = ref
         k = len(items)
@@ -654,10 +951,10 @@ class Live(QWidget):
             if j < 0:
                 c.setData([], [])
                 continue
-            y = items[j][2]
+            y = self.normalised_signal(key, items[j][2])
             if self.level_lock:
-                m = float(np.median(y))
-                if m > 0:
+                m = float(np.nanmedian(y))
+                if np.isfinite(m) and m > 0:
                     y = y * (ref / m)
             c.setData(xs, y)
         lo, hi = self.link_scale.get(key, (self.wf_min, self.wf_max))
@@ -696,19 +993,61 @@ class Live(QWidget):
     def make_panel(self, title, r, c):
         box = QVBoxLayout()
         lab = QLabel(title)
+        lab.setContentsMargins(6, 2, 6, 2)
         lab.setStyleSheet(f'color: {INK}; font-size: 12px; font-weight: bold;')
         gl = pg.GraphicsLayoutWidget()
         gl.setBackground(SURFACE)
         gl.ci.layout.setSpacing(4)
         gl.ci.setContentsMargins(0, 0, 0, 0)
-        gl.setMinimumHeight(120)
+        gl.setMinimumHeight(0)
+        gl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         w = QWidget()
+        w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         box.setContentsMargins(0, 0, 0, 0)
         box.addWidget(lab)
         box.addWidget(gl, 1)
         w.setLayout(box)
+        w.setObjectName('linkPanel')
         self.grid.addWidget(w, r, c)
-        return dict(gl=gl, lab=lab, cells=[])
+        return dict(widget=w, gl=gl, lab=lab, title=title, cells=[], row=r, col=c)
+
+    def arrange_panels(self):
+        """Give pinned-TX links the plot area and collapse inactive links to labels."""
+        for pan in self.panels.values():
+            self.grid.removeWidget(pan['widget'])
+        for row in range(4):
+            self.grid.setRowStretch(row, 0)
+        for col in range(3):
+            self.grid.setColumnStretch(col, 1)
+
+        if self.tx_sel == 'round-robin':
+            for pan in self.panels.values():
+                pan['widget'].setMinimumHeight(0)
+                pan['widget'].setMaximumHeight(16777215)
+                pan['widget'].setStyleSheet('QWidget#linkPanel { border: none; }')
+                pan['gl'].show()
+                self.grid.addWidget(pan['widget'], pan['row'], pan['col'])
+            for row in range(4):
+                self.grid.setRowStretch(row, 1)
+            return
+
+        active_tx = self.by_label[self.tx_sel]
+        active = [pan for key, pan in self.panels.items() if key[0] == active_tx]
+        inactive = [pan for key, pan in self.panels.items() if key[0] != active_tx]
+        for col, pan in enumerate(active):
+            pan['widget'].setMinimumHeight(0)
+            pan['widget'].setMaximumHeight(16777215)
+            pan['widget'].setStyleSheet('QWidget#linkPanel { border: none; }')
+            pan['gl'].show()
+            self.grid.addWidget(pan['widget'], 0, col)
+        self.grid.setRowStretch(0, 1)
+        for i, pan in enumerate(inactive):
+            pan['gl'].hide()
+            pan['widget'].setFixedHeight(34)
+            pan['widget'].setStyleSheet(
+                f'QWidget#linkPanel {{ background: {PANEL}; border: 1px solid {BORDER}; '
+                'border-radius: 6px; }')
+            self.grid.addWidget(pan['widget'], 1 + i // 3, i % 3)
 
     # ---- inputs ----
 
@@ -761,7 +1100,7 @@ class Live(QWidget):
                         self.amp_mean *= 0.995
                         self.amp_mean += 0.005 * amp
                     rec = self.rec   # single read: stop_record may clear it mid-loop
-                    if rec is not None:
+                    if rec is not None and now >= rec['t0']:
                         rec['recs'][rx].append((now, tx, lts, rssi, amp, iq, gmeta))
                     with self.lock:
                         if key not in self.buf:
@@ -868,19 +1207,21 @@ class Live(QWidget):
             self.rec_status.setText(f'<span style="color:#d03b3b">protocol: {e}</span>')
             return
         self.proto = dict(timing=timing, takes=takes, i=0, phase=LEAD,
-                          until=time.time() + timing['lead_in'])
+                          until=time.time() + timing['lead_in'], record_rate_armed=False)
         self.cue = Cue()
         self.cue.show()
         self.cue.raise_()
         self.proto_btn.setText('■ ABORT')
         self.rec_btn.setEnabled(False)
         self.prefix_edit.setEnabled(False)
+        self.apply_protocol_idle_rate()
         self.proto_tick()
 
     def abort_protocol(self, why, keep_cue=False):
         if self.rec is not None:
             self.stop_record()          # never leave a half-written take on disk
         self.proto = None
+        self.apply_rate_preset()
         if self.cue is not None and not keep_cue:
             self.cue.close()
             self.cue = None
@@ -914,12 +1255,19 @@ class Live(QWidget):
         name, instruction = p['takes'][p['i']]
         left = p['until'] - now
 
+        # Let the boards return to the selected capture rate before timestamps enter
+        # the take, while still giving them nearly all of each lead-in and gap to rest.
+        if p['phase'] == LEAD and not p['record_rate_armed'] and left <= 1.0:
+            self.apply_rate_preset(force=True)
+            p['record_rate_armed'] = True
+
         if left <= 0:
             if p['phase'] == LEAD:
                 self.start_record(f'{self.session_dir()}/{name}')
                 p['phase'], p['until'] = REC, now + t['duration']
             elif p['phase'] == REC:
                 self.stop_record()
+                self.apply_protocol_idle_rate()
                 p['phase'], p['until'] = GAP, now + t['gap']
             else:
                 p['i'] += 1
@@ -927,6 +1275,7 @@ class Live(QWidget):
                     return self.abort_protocol(
                         f'finished — {len(p["takes"])} takes written')
                 p['phase'], p['until'] = LEAD, now + t['lead_in']
+                p['record_rate_armed'] = False
             name, instruction = p['takes'][p['i']]
             left = p['until'] - now
 
@@ -938,7 +1287,7 @@ class Live(QWidget):
         if p['phase'] == LEAD:
             self.cue.show_state(LEAD, step, instruction, left, 'GET READY — recording starts at 0')
         elif p['phase'] == REC:
-            self.cue.show_state(REC, step, instruction, left, '● RECORDING — hold')
+            self.cue.show_state(REC, step, instruction, left, '● RECORDING')
         else:
             self.cue.show_state(GAP, step, 'REST', left, f'next: {nxt}')
 
@@ -953,7 +1302,8 @@ class Live(QWidget):
         own = owner_of(prefix)
         # t0 is stamped before any thread can append, so every timestamp written is
         # relative to a single instant rather than to whenever a thread first woke.
-        self.rec = dict(prefix=prefix, name=name, t0=time.time(), own=own,
+        t0_ns = time.time_ns()
+        self.rec = dict(prefix=prefix, name=name, t0=t0_ns / 1e9, t0_ns=t0_ns, own=own,
                         recs={m: [] for m in self.macs}, frames=[], idx=0,
                         jpeg=JpegWriter(f'{prefix}_frames', self.args.quality,
                                         self.args.encoders, self.args.queue, own,
@@ -974,7 +1324,7 @@ class Live(QWidget):
         recs = {k: list(v) for k, v in rec['recs'].items()}
         frames = list(rec['frames'])
         rec['jpeg'].close()
-        meta = dict(t0_epoch=rec['t0'], mode=self.tx_sel,
+        meta = dict(t0_epoch=rec['t0'], t0_epoch_ns=rec['t0_ns'], mode=self.tx_sel,
                     round_duration=self.args.round_duration,
                     width=self.cam.w, height=self.cam.h, fps_requested=self.cam.fps,
                     frame_dir=f'{rec["prefix"]}_frames', jpeg_quality=self.args.quality,
@@ -1016,9 +1366,19 @@ class Live(QWidget):
         self.csi_on = False
         self.style_csi_button()
         self.scan = dict(phase='parking', until=time.time() + 0.4,
-                         data={m: {} for m in self.macs}, done=set())
+                          data={m: {} for m in self.macs}, done=set())
+        self.scan_result_timer.stop()
+        self.scan_btn.setText('⚡ SCANNING…')
         self.scan_btn.setEnabled(False)
         self.scan_label.setText('parking the radio …')
+
+    def reset_scan_button(self):
+        if self.scan is None:
+            self.scan_btn.setText('⚡ FIND BEST CHANNEL')
+
+    def show_scan_result(self, text):
+        self.scan_btn.setText(text)
+        self.scan_result_timer.start(5000)
 
     def on_stats_line(self, board, line):
         """STATS,framedrops=N,textdrops=N,sendfail=N,heap=N — the board's own drop
@@ -1033,6 +1393,16 @@ class Live(QWidget):
                     pass
         with self.lock:
             self.board_stats[board] = out
+
+    def reset_drop_stats(self):
+        """Zero the displayed counters without rebooting or changing raw data."""
+        with self.lock:
+            self.drop_board_base = {
+                m: d.get('framedrops', 0) + d.get('sendfail', 0)
+                for m, d in self.board_stats.items()
+            }
+            self.drop_host_base = self.read_errors + self.clipped
+        self.tiles['drops'].set('0·0')
 
     def on_scan_line(self, board, line):
         """Called from a reader thread, so everything here takes the lock."""
@@ -1100,9 +1470,11 @@ class Live(QWidget):
             self.scan_label.setText(
                 '<span style="color:#ff5555">survey returned nothing — do the boards '
                 'have firmware with SCAN?</span>')
+            self.show_scan_result('NO CHANNEL FOUND')
             return
         ranked = rank_channels(stats)
         best, best_bytes, best_rssi, span = ranked[0]
+        self.show_scan_result(f'CH {best} FOUND')
         cur = next((r for r in ranked if r[0] == self.args.channel), None)
         # One line on screen; the full per-channel table goes to stdout below, where
         # it can be scrolled back rather than crowding the controls.
@@ -1140,13 +1512,6 @@ class Live(QWidget):
             return 'wait for the survey to finish — it is retuning the radio itself.'
         return None
 
-    # Measured-clean rate for each width at BW 40 (the knee minus ~10%; see NOTES.md).
-    # Rate presets as fractions of the live wire ceiling. Buttons, not a type box:
-    # the ceiling moves with SUB, BW and MODE, and a number typed for one config is
-    # a saturation accident waiting in another. MAX is 90% of ceiling -- the
-    # operating point every clean benchmark on this rig was measured at.
-    RATE_FRACTIONS = {'low': 0.25, 'mid': 0.50, 'high': 0.75, 'max': 0.90}
-
     def frame_width(self, sel=None):
         """Subcarriers per frame for a SUB selection, accounting for HT20's fallback:
         the 30/166 tables index up to subcarrier 190, which does not exist in a
@@ -1169,11 +1534,20 @@ class Live(QWidget):
         return min(int(ceil), 2000)
 
     def preset_hz(self, key):
-        return max(1, int(self.RATE_FRACTIONS[key] * self.wire_ceiling()))
+        return int(key)
+
+    def protocol_idle_hz(self):
+        """Temporary protocol rest rate: 25 Hz per RR link, 100 Hz pinned."""
+        return 25 * len(self.macs) if self.tx_sel == 'round-robin' else 100
+
+    def apply_protocol_idle_rate(self):
+        """Lower the rate between takes without changing the selected preset."""
+        self.send_rate(self.protocol_idle_hz())
 
     def refresh_rate_buttons(self):
+        divisor = len(self.macs) if self.tx_sel == 'round-robin' else 1
         for key, b in self.rate_buttons.items():
-            b.setText(f'{key.upper()} {self.preset_hz(key)}')
+            b.setText(str(key // divisor))
 
     def pick_rate_preset(self, key):
         why = self.busy_reason()
@@ -1184,19 +1558,15 @@ class Live(QWidget):
         self.rate_preset = key
         self.apply_rate_preset(announce=True)
 
-    def apply_rate_preset(self, announce=False):
-        """Re-resolve the active preset against the CURRENT ceiling and send it.
-        Called on every SUB/BW/mode change, so MAX means max-for-this-config,
-        always -- pinning a board that was at round-robin MAX would otherwise slam
-        one receiver's wire at ~170%."""
+    def apply_rate_preset(self, announce=False, force=False):
+        """Send the selected fixed rate after a button or radio-layout change."""
         self.refresh_rate_buttons()
-        if self.rec is not None or self.proto is not None:
+        if (self.rec is not None or self.proto is not None) and not force:
             return                       # never retune mid-take
         hz = self.preset_hz(self.rate_preset)
         if self.send_rate(hz) and announce:
             self.rec_status.setText(
-                f'rate → {hz} Hz ({self.rate_preset.upper()} · '
-                f'ceiling {self.wire_ceiling()} Hz here)')
+                f'rate → {hz} Hz · wire ceiling {self.wire_ceiling()} Hz here')
 
     def send_rate(self, hz):
         ok = True
@@ -1221,7 +1591,7 @@ class Live(QWidget):
         why = self.busy_reason()
         if why:
             self.rec_status.setText(f'<span style="color:#ff5555">{why}</span>')
-            self.sub_buttons[self.sub_sel if self.sub_sel in self.sub_buttons else 166].setChecked(True)
+            self.sub_buttons[self.sub_sel if self.sub_sel in self.sub_buttons else 30].setChecked(True)
             return
         ok = True
         for m in self.macs:
@@ -1234,22 +1604,24 @@ class Live(QWidget):
             self.apply_rate_preset()
             self.rec_status.setText(
                 f'subcarriers → {self.frame_width()} · rate → {self.rate_val} Hz '
-                f'({self.rate_preset.upper()} · ceiling {self.wire_ceiling()} Hz)')
+                f'(wire ceiling {self.wire_ceiling()} Hz)')
             self.recalibrate()
 
-    def toggle_bw(self):
-        """Flip the whole rig between 20 and 40 MHz.
+    def set_bw(self, want):
+        """Set the whole rig to 20 or 40 MHz.
 
-        Neither is simply better, which is why it is a button: 40 MHz carries more
+        Neither is simply better: 40 MHz carries more
         subcarriers, 20 MHz is narrow enough to escape a congested band entirely --
         measured here, HT20 on a quiet channel delivered 99.7% against HT40's 91%.
         A recording's frames say which was active (n_sub 128 against 166/192).
         """
+        if want == self.bw:
+            return
         why = self.busy_reason()
         if why:
             self.rec_status.setText(f'<span style="color:#ff5555">{why}</span>')
+            self.bw_buttons[self.bw].setChecked(True)
             return
-        want = 20 if self.bw == 40 else 40
         ok = True
         for m in self.macs:
             try:
@@ -1257,9 +1629,9 @@ class Live(QWidget):
             except (serial.SerialException, OSError):
                 ok = False
         if not ok:
+            self.bw_buttons[self.bw].setChecked(True)
             return
         self.bw = want
-        self.bw_btn.setText(f'BW: {want} MHz')
         self.apply_rate_preset()
         # The subcarrier layout just changed: stale columns and a mean built on the
         # old width would both mislead, and the field split must be re-derived.
@@ -1279,6 +1651,7 @@ class Live(QWidget):
         self.fields_at = 0.0
         self.seen_min = self.seen_max = None
         self.link_scale.clear()
+        self.disable_profile_norm(announce=False)
 
     def set_channel(self, ch):
         """Move every board together. A board left behind hears nothing and shows up
@@ -1328,6 +1701,7 @@ class Live(QWidget):
         arrangement -- otherwise panels for links that just went silent would keep
         showing their last packets as though they were still live."""
         self.tx_sel = name
+        self.arrange_panels()
         with self.lock:
             for k in self.buf:
                 self.buf[k].clear()
@@ -1416,9 +1790,12 @@ class Live(QWidget):
                 # Same clock discipline as capture_synced: the driver's DMA-completion
                 # timestamp, not the moment this thread got round to looking.
                 wall = ts + self.mono_offset if self.cam.monotonic else time.time()
-                rec['frames'].append((rec['idx'], seq, wall))
-                rec['jpeg'].submit(rec['idx'], buf, self.cam.w, self.cam.h)
-                rec['idx'] += 1
+                # A frame already queued in the driver can predate the button press;
+                # exclude it so every shared-origin timestamp is non-negative.
+                if wall >= rec['t0']:
+                    rec['frames'].append((rec['idx'], seq, wall))
+                    rec['jpeg'].submit(rec['idx'], buf, self.cam.w, self.cam.h)
+                    rec['idx'] += 1
             rgb = self.cam.to_rgb(buf, self.cam.w, self.cam.h)
             with self.lock:
                 self.frame = rgb
@@ -1499,22 +1876,36 @@ class Live(QWidget):
             self.cam_label.setPixmap(QPixmap.fromImage(qi).scaled(
                 self.cam_label.width(), self.cam_label.height(),
                 QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        self.cam_fps.adjustSize()
+        self.cam_fps.move(max(self.cam_label.width() - self.cam_fps.width() - 12, 0), 12)
+        self.cam_fps.raise_()
 
         sel = self.tx_sel
         active_tx = None if sel == 'round-robin' else self.by_label[sel]
 
-        fills, gots, rates = [], [], []
         for key, pan in self.panels.items():
             live = active_tx is None or key[0] == active_tx
-            pan['lab'].setStyleSheet(
-                f'color: {INK if live else "#4a4a4c"}; font-size: 12px; '
-                f'font-weight: {"bold" if live else "normal"};')
-            M, ncol, span = self.last_packets(key, now)
+            rate, loss = self.link_health.get(key, (0.0, None))
             if live:
-                fills.append(ncol)
-                gots.append(span)
-                with self.lock:
-                    rates.append(len(self.buf[key]) / max(self.args.hold, 1e-9))
+                loss_text = 'loss —' if loss is None else f'{loss:.1f}% loss'
+                pan['lab'].setText(f'{pan["title"]} · {rate:.0f} Hz · {loss_text}')
+                label_color = (INK if loss is None else
+                               GOOD if loss <= 1 else WARN if loss <= 5 else BAD)
+            else:
+                pan['lab'].setText(f'{pan["title"]} · inactive')
+                label_color = '#4a4a4c'
+            pan['lab'].setStyleSheet(
+                f'color: {label_color}; font-size: 12px; '
+                f'font-weight: {"bold" if live else "normal"};')
+            if not live:
+                if self.view_mode == 'spectrum':
+                    for curve in pan['curves']:
+                        curve.setData([], [])
+                else:
+                    for img, _vb, _lo, _hi in pan['cells']:
+                        img.clear()
+                continue
+            M, _ncol, _span = self.last_packets(key, now)
             if self.view_mode == 'spectrum':
                 self.draw_spectrum(key, pan)
                 continue
@@ -1522,6 +1913,7 @@ class Live(QWidget):
                 for img, _vb, _lo, _hi in pan['cells']:
                     img.clear()
                 continue
+            M = self.normalised_signal(key, M)
             # Absolute values, one colour ceiling per field cell: the fields differ
             # ~5x in gain, so a shared ceiling would leave the LLTF permanently dark.
             # Each ceiling moves on the same asymmetric-EMA + ladder as the spectrum
@@ -1600,42 +1992,50 @@ class Live(QWidget):
             self.update_tiles(now, ftimes)
 
     def update_tiles(self, now, ftimes):
-        """The strip: everything is measured over the last --hold seconds of what the
-        boards actually delivered, the same window the panels draw."""
+        """Update live health; the Hz and delivery tiles use a one-second window."""
+        active_tx = (None if self.tx_sel == 'round-robin'
+                     else self.by_label[self.tx_sel])
         with self.lock:
             links = {k: (np.array([it[0] for it in v]),
                          np.array([it[1] for it in v]))
-                     for k, v in self.buf.items() if len(v) > 3}
+                     for k, v in self.buf.items()
+                     if v and (active_tx is None or k[0] == active_tx)}
             stats = {m: dict(d) for m, d in self.board_stats.items()}
-        # Rates over each link's actual data span, not the nominal window: after a
-        # TX swap the buffers restart empty, and count-over-window ramps up for a
-        # full --hold seconds -- pinning A at 1000 Hz read ~500 mid-ramp. Span-based
-        # rates snap to the truth within a second.
-        per = {}
-        for k, (h, _l) in links.items():
-            span = h[-1] - h[0]
-            if span > 0.3:
-                per[k] = (len(h) - 1) / span
+        # A literal trailing one-second count: responsive enough to show a rate
+        # change immediately and independent of the multi-second plot buffer.
+        cutoff = now - 1.0
+        per = {k: float(np.count_nonzero(h >= cutoff))
+               for k, (h, _l) in links.items()}
         rates = list(per.values())
         total_rate = sum(rates)
         self.tiles['rate'].set(f'{np.mean(rates):.0f} Hz' if rates else '—')
 
         if self.csi_on and self.rate_val and rates:
-            deliv = 100.0 * total_rate / self.rate_val
+            expected = self.rate_val * max(len(self.macs) - 1, 1)
+            deliv = 100.0 * total_rate / expected
             self.tiles['deliv'].set(f'{min(deliv, 100):.1f}%',
                                     GOOD if deliv >= 97 else WARN if deliv >= 90 else BAD)
         else:
             self.tiles['deliv'].set('—')
 
-        # Radio loss from the boards' hardware receive clocks: consecutive-arrival
-        # steps measured in ping periods. Steps past 8 periods are the round-robin
-        # blind gap (schedule, not loss) and are excluded.
+        # Radio loss over the same trailing second as the Hz tile, using the boards'
+        # hardware receive clocks. Consecutive-arrival steps are measured in ping
+        # periods; steps past 8 periods are the round-robin blind gap (schedule, not
+        # loss) and are excluded.
         sent = got = 0
-        for _h, lts in links.values():
-            st = np.rint(np.diff(np.sort(lts)) * self.rate_val).astype(int)
+        per_loss = {}
+        for key, (h, lts) in links.items():
+            recent = lts[h >= cutoff]
+            st = np.rint(np.diff(np.sort(recent)) * self.rate_val).astype(int)
             st = st[(st >= 1) & (st <= 8)]
-            sent += int(st.sum())
-            got += len(st)
+            link_sent, link_got = int(st.sum()), len(st)
+            sent += link_sent
+            got += link_got
+            if link_sent:
+                per_loss[key] = 100.0 * (link_sent - link_got) / link_sent
+        self.link_health = {
+            key: (rate, per_loss.get(key)) for key, rate in per.items()
+        }
         if sent:
             loss = 100.0 * (sent - got) / sent
             self.tiles['loss'].set(f'{loss:.1f}%',
@@ -1656,16 +2056,27 @@ class Live(QWidget):
         self.tiles['wire'].set(f'{100 * util:.0f}%',
                                None if util < 0.9 else WARN if util < 0.98 else BAD)
 
-        board = sum(d.get('framedrops', 0) + d.get('sendfail', 0)
-                    for d in stats.values())
-        host = self.read_errors + self.clipped
+        board = 0
+        for m, d in stats.items():
+            current = d.get('framedrops', 0) + d.get('sendfail', 0)
+            base = self.drop_board_base.get(m, 0)
+            if current < base:        # this board rebooted since the display reset
+                self.drop_board_base[m] = current
+                base = current
+            board += current - base
+        host = self.read_errors + self.clipped - self.drop_host_base
         self.tiles['drops'].set(f'{board}·{host}', None if not (board or host) else BAD)
 
         cam_fps = 0.0
         if len(ftimes) > 2:
             cam_fps = (len(ftimes) - 1) / max(ftimes[-1] - ftimes[0], 1e-9)
-        self.tiles['cam'].set(f'{cam_fps:.0f} fps',
-                              None if cam_fps > 25 else WARN if cam_fps > 15 else BAD)
+        fps_color = INK if cam_fps > 25 else WARN if cam_fps > 15 else BAD
+        self.cam_fps.setText(f'{cam_fps:.0f} fps')
+        self.cam_fps.setStyleSheet(
+            f'font-size: 17px; font-weight: bold; color: {fps_color}; '
+            'background-color: rgba(16, 18, 24, 185); '
+            'border: 1px solid rgba(255, 255, 255, 35); border-radius: 7px; '
+            'padding: 4px 8px;')
 
         if self.seen_max is not None:
             self.seen_label.setText(

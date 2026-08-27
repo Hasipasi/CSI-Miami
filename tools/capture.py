@@ -21,8 +21,9 @@ the anchor -- and crucially, without re-capturing anything. The assignment writt
 here is the plain nearest-frame one on arrival time; the refinement is left to
 analysis, which is why `|lts` is on disk.
 
-Output keeps `tx|rx|t` and `tx|rx|a` byte-compatible with capture_wizard.py, so
-the existing plot_*/analyze_* tools read these captures unchanged.
+Output is one self-contained NPZ: CSI arrays plus JPEG entries under `frames/`.
+It keeps `tx|rx|t` and `tx|rx|a` byte-compatible with older captures, and adds
+shared-origin int64 nanosecond fields for exact integer time arithmetic.
 
   python3 capture_synced.py --prefix take1 --seconds 60
   python3 capture_synced.py --prefix take1 --seconds 60 --mode fixedtx
@@ -44,6 +45,7 @@ import signal
 import sys
 import threading
 import time
+import zipfile
 from io import StringIO
 
 import numpy as np
@@ -938,7 +940,7 @@ class JpegWriter:
 
 
 def write_capture(prefix, recs, frames, t0, meta, own=None):
-    """Write one capture to <prefix>.npz and return (path, per-link report, frame times).
+    """Write one self-contained capture and return (path, report, frame times).
 
     Kept module-level and shared so the live viewer and the headless recorder cannot
     drift into two different on-disk formats.
@@ -961,7 +963,9 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
     """
     out, report = {}, []
     ft = np.array([f[2] for f in frames], dtype=np.float64) - t0
+    ft_ns = np.rint(ft * 1_000_000_000).astype(np.int64)
     out['frame_t'] = ft
+    out['frame_t_ns'] = ft_ns
     out['frame_epoch'] = np.array([f[2] for f in frames], dtype=np.float64)
     out['frame_seq'] = np.array([f[1] for f in frames], dtype=np.int64)
     out['frame_idx'] = np.array([f[0] for f in frames], dtype=np.int32)
@@ -981,8 +985,10 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
             n = max(lens, key=lens.get)
             seq = [s for s in seq if len(s[3]) == n]
             t = np.array([s[0] for s in seq], dtype=np.float64) - t0
+            t_ns = np.rint(t * 1_000_000_000).astype(np.int64)
             k = f'{tx}|{rx}'
             out[f'{k}|t'] = t.astype(np.float32)
+            out[f'{k}|t_ns'] = t_ns
             out[f'{k}|a'] = np.stack([s[3] for s in seq])
             if all(s[4] is not None for s in seq):
                 out[f'{k}|iq'] = np.stack([s[4] for s in seq]).astype(np.complex64)
@@ -991,7 +997,9 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
                 out[f'{k}|agc'] = np.array([s[5][1] for s in seq], dtype=np.int16)
                 out[f'{k}|fft'] = np.array([s[5][2] for s in seq], dtype=np.int16)
             out[f'{k}|rssi'] = np.array([s[2] for s in seq], dtype=np.int16)
-            out[f'{k}|lts'] = unwrap_us([s[1] for s in seq]) / 1e6
+            lts_us = unwrap_us([s[1] for s in seq])
+            out[f'{k}|lts'] = lts_us / 1e6
+            out[f'{k}|lts_ns'] = np.rint(lts_us * 1000).astype(np.int64)
             worst = None
             if len(ft) >= 2:
                 # nearest frame in time, and how far off it was -- keeping the
@@ -1001,16 +1009,45 @@ def write_capture(prefix, recs, frames, t0, meta, own=None):
                 pick = np.where(np.abs(t - ft[j - 1]) <= np.abs(t - ft[j]), j - 1, j)
                 out[f'{k}|f'] = pick.astype(np.int32)
                 out[f'{k}|dt'] = (t - ft[pick]).astype(np.float32)
+                out[f'{k}|dt_ns'] = t_ns - ft_ns[pick]
                 worst = float(np.max(np.abs(t - ft[pick]))) * 1e3
             elif len(ft) == 1:
                 out[f'{k}|f'] = np.zeros(len(t), dtype=np.int32)
                 out[f'{k}|dt'] = (t - ft[0]).astype(np.float32)
+                out[f'{k}|dt_ns'] = t_ns - ft_ns[0]
                 worst = float(np.max(np.abs(t - ft[0]))) * 1e3
             report.append((k, len(t), worst))
 
+    meta = dict(meta)
+    meta.update(timestamp_origin='record_start', timestamp_unit='nanoseconds',
+                timestamp_dtype='int64',
+                frame_storage='npz:frames/{frame_idx:06d}.jpg')
+    meta['frame_dir'] = None
     out['meta'] = np.array(json.dumps(meta))
     path = f'{prefix}.npz'
-    np.savez_compressed(path, **out)
+    tmp = f'{path}.tmp'
+    # NPZ is a ZIP container. NumPy arrays remain ordinary .npy members, while the
+    # already-compressed JPEGs are appended verbatim: one portable file without
+    # wasting time or quality recompressing images.
+    with open(tmp, 'wb') as fh:
+        np.savez_compressed(fh, **out)
+    frame_dir = f'{prefix}_frames'
+    jpgs = sorted(pathlib.Path(frame_dir).glob('*.jpg'))
+    with zipfile.ZipFile(tmp, 'a', compression=zipfile.ZIP_STORED) as zf:
+        for jpg in jpgs:
+            zf.write(jpg, f'frames/{jpg.name}')
+    # Validate the complete archive before it replaces the destination or any
+    # temporary JPEG is removed. A failed stop therefore leaves recoverable files.
+    with zipfile.ZipFile(tmp) as zf:
+        if zf.testzip() is not None:
+            raise OSError(f'capture archive failed CRC validation: {tmp}')
+    os.replace(tmp, path)
+    for jpg in jpgs:
+        jpg.unlink()
+    try:
+        pathlib.Path(frame_dir).rmdir()
+    except OSError:
+        pass
     give(path, own)
     return path, report, ft
 
@@ -1127,6 +1164,8 @@ class Recorder:
             if not self.collecting:
                 continue
             wall = ts + self.mono_offset if self.cam.monotonic else time.time()
+            if wall < self.t0:
+                continue              # queued before the shared recording zero
             self.frames.append((idx, seq, wall))
             self.jpeg.submit(idx, buf, self.cam.w, self.cam.h)
             idx += 1
@@ -1139,6 +1178,12 @@ class Recorder:
         print(f'camera {a.device} {self.cam.w}x{self.cam.h} @ {self.cam.fps:g} fps, '
               f'mode {a.mode}' + (f', {a.round_duration * 1000:.0f} ms dwell'
                                   if a.mode == 'roundrobin' else ''))
+
+        if a.rate is not None:
+            for board in self.boards.values():
+                board.write(f'RATE {a.rate}\n'.encode())
+            time.sleep(0.1)
+            print(f'rate {a.rate} Hz')
 
         readers = []
         for m in self.macs:
@@ -1157,7 +1202,8 @@ class Recorder:
         print(f'\nwarming up {a.warmup:.0f}s ...', flush=True)
         time.sleep(a.warmup)
 
-        self.t0 = time.time()
+        self.t0_ns = time.time_ns()
+        self.t0 = self.t0_ns / 1e9
         self.collecting = True
         self.set_leds(GREEN)
         print(f'RECORDING {a.seconds:.0f}s  (Ctrl-C to stop early)')
@@ -1198,7 +1244,8 @@ class Recorder:
 
     def save(self):
         a = self.args
-        meta = dict(t0_epoch=self.t0, mode=a.mode, round_duration=a.round_duration,
+        meta = dict(t0_epoch=self.t0, t0_epoch_ns=self.t0_ns,
+                    mode=a.mode, round_duration=a.round_duration,
                     width=self.cam.w, height=self.cam.h, fps_requested=self.cam.fps,
                     frame_dir=self.frame_dir, jpeg_quality=a.quality,
                     boards={m: LABEL.get(m[-5:], '?') for m in self.macs},
@@ -1209,7 +1256,7 @@ class Recorder:
         out = {'frame_seq': np.array([f[1] for f in self.frames], dtype=np.int64)}
         dur = ft[-1] - ft[0] if len(ft) > 1 else 0.0
         gaps = int(np.sum(np.diff(out['frame_seq']) - 1)) if len(ft) > 1 else 0
-        print(f'\nwrote {path} and {self.frame_dir}/')
+        print(f'\nwrote self-contained capture {path}')
         print(f'  {len(ft)} frames over {dur:.1f}s = {len(ft) / max(dur, 1e-9):.2f} fps '
               f'achieved (requested {self.cam.fps:g})')
         if gaps:
@@ -1256,6 +1303,8 @@ def main():
     ap.add_argument('--width', type=int, default=1280)
     ap.add_argument('--height', type=int, default=720)
     ap.add_argument('--fps', type=float, default=30.0)
+    ap.add_argument('--rate', type=int, default=None,
+                    help='set the firmware ping rate before recording')
     ap.add_argument('--quality', type=int, default=85)
     ap.add_argument('--mode', choices=['roundrobin', 'fixedtx'], default='roundrobin')
     ap.add_argument('--tx', default=None,

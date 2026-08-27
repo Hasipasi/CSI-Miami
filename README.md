@@ -144,7 +144,7 @@ anything else that talks to the boards.
 ## The pipeline
 
 ```
-firmware ──UART──▶ tools/capture.py ──▶ data/<session>/*.npz + *_frames/
+firmware ──UART──▶ tools/capture.py ──▶ data/<session>/*.npz
                         │                        │
                    tools/viewer.py          tools/check_session.py   (validate)
                    (GUI + protocols)             │
@@ -175,7 +175,10 @@ takes:
 
 The set is **cycled**, not repeated take-by-take, so repeats of one activity land
 minutes apart and are far more independent samples. Output goes to
-`data/<yaml name>/<take><round>.npz` plus a matching `_frames/` directory.
+`data/<yaml name>/<take><round>.npz`. Each capture is self-contained: NumPy arrays
+and JPEGs (`frames/000000.jpg`, etc.) share one archive. `frame_t_ns` and every
+`<tx>|<rx>|t_ns` use signed int64 nanoseconds from the same recording-start zero;
+`frame_idx` maps each timestamp to its embedded JPEG name.
 
 **A board can go silent mid-session** — the viewer refuses to start a protocol if one
 is quiet and aborts the moment one drops, because a silent board produces takes
