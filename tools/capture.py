@@ -60,13 +60,19 @@ N_META = 25
 TS_FIELD = 18                      # local_timestamp, microseconds, per the firmware header
 RSSI_FIELD = 3
 TS_WRAP = 1 << 32                  # the board counter is 32-bit microseconds
+C5_MACS = {'10:bd:a3:e6:62:3c', '10:bd:a3:e6:37:f4'}
 
 # 'E' is the returned fifth board (ec:da:3b:4c:b8:d0 / 5C39018759). Its documented
 # RX fault (11x same-pair asymmetry) did NOT reproduce on the 2026-08-24 matrix
 # retest -- 100% as receiver, best of four -- but it keeps its own letter so it can
 # never be confused with the original A, and the intermittent-fault suspicion in
 # NOTES.md stays attached to this silicon, not to whatever slot it occupies.
-LABEL = {'2d:3c': 'A', '6b:5c': 'B', 'ab:d4': 'C', '2d:a8': 'D', 'b8:d0': 'E'}
+LABEL = {
+    '2d:3c': 'A', '6b:5c': 'B', 'ab:d4': 'C', '2d:a8': 'D', 'b8:d0': 'E',
+    # ESP32-C5-DevKitC-1 boards added 2026-09-10. Keep distinct labels so the
+    # original S3 hardware can be connected at the same time without collisions.
+    '62:3c': 'F', '37:f4': 'G',
+}
 
 # ------------------------------------------------------------ subcarrier layout
 # The radio reports 192 subcarriers as three 64-wide fields (LLTF | HT-LTF |
@@ -1179,6 +1185,11 @@ class Recorder:
               f'mode {a.mode}' + (f', {a.round_duration * 1000:.0f} ms dwell'
                                   if a.mode == 'roundrobin' else ''))
 
+        for board in self.boards.values():
+            board.write(f'BAND {a.band}\n'.encode())
+        time.sleep(0.1)
+        print(f'band {a.band} GHz (channel {120 if a.band == "5.6" else 13})')
+
         if a.rate is not None:
             for board in self.boards.values():
                 board.write(f'RATE {a.rate}\n'.encode())
@@ -1246,6 +1257,9 @@ class Recorder:
         a = self.args
         meta = dict(t0_epoch=self.t0, t0_epoch_ns=self.t0_ns,
                     mode=a.mode, round_duration=a.round_duration,
+                    wifi_band_ghz=a.band,
+                    wifi_channel=120 if a.band == '5.6' else 13,
+                    wifi_bandwidth_mhz=20 if a.band == '5.6' else 40,
                     width=self.cam.w, height=self.cam.h, fps_requested=self.cam.fps,
                     frame_dir=self.frame_dir, jpeg_quality=a.quality,
                     boards={m: LABEL.get(m[-5:], '?') for m in self.macs},
@@ -1305,10 +1319,12 @@ def main():
     ap.add_argument('--fps', type=float, default=30.0)
     ap.add_argument('--rate', type=int, default=None,
                     help='set the firmware ping rate before recording')
+    ap.add_argument('--band', default='2.4', choices=('2.4', '5.6'),
+                    help='radio band; 5.6 requires ESP32-C5 boards')
     ap.add_argument('--quality', type=int, default=85)
     ap.add_argument('--mode', choices=['roundrobin', 'fixedtx'], default='roundrobin')
     ap.add_argument('--tx', default=None,
-                    help='with --mode fixedtx, which board transmits (A/B/C/D)')
+                    help='with --mode fixedtx, which discovered board label transmits')
     ap.add_argument('--round-duration', type=float, default=0.025,
                     help='seconds each board holds the transmit token. This sets the '
                          'blind gap between a link\'s bursts, not its average rate. '

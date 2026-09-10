@@ -29,3 +29,8 @@ __pycache__/
 # Native macOS venv for running the viewer off the rig PC (see MacCamera in
 # tools/capture.py). Linux uses the container instead.
 /.venv_mac/
+
+# Espressif's official esp-csi repo, kept as reference documentation only: nothing
+# in it is built. The pieces of it we USE arrive through the component registry
+# (esp_csi_gain_ctrl in firmware/managed_components) with pinned versions.
+/esp-csi-master/

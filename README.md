@@ -11,9 +11,10 @@ GUI, and a separate Python venv only for the pose model (which wants CUDA).
 
 ## The hardware
 
-**Four ESP32-S3 (N16R8) boards**, USB to one PC, all running identical firmware.
-They are identified by MAC, never by `/dev/ttyACM*` — the path changes on every
-replug and the tooling auto-discovers.
+The original rig uses **four ESP32-S3 (N16R8) boards**. The firmware and tools now
+also support the dual-band **ESP32-C5-DevKitC-1** boards. Boards are identified by
+MAC, never by `/dev/ttyACM*` or `/dev/cu.*` — paths change on every replug and the
+tooling auto-discovers.
 
 | label | MAC | USB serial |
 |---|---|---|
@@ -21,6 +22,14 @@ replug and the tooling auto-discovers.
 | B | `dc:da:0c:77:6b:5c` | 5C37262351 |
 | C | `30:30:f9:1d:ab:d4` | 5C39018763 |
 | D | `14:c1:9f:c1:2d:a8` | 5C39020696 |
+| F | `10:bd:a3:e6:62:3c` | 5C94096576 |
+| G | `10:bd:a3:e6:37:f4` | 5C94096770 |
+
+F/G are ESP32-C5 boards. An all-C5 rig can switch live between 2.4 GHz channel 13
+and 5.600 GHz channel 120 from the GUI. The verified C5 5.6 GHz CSI mode is HT20;
+the GUI selects 20 MHz and disables its 40 MHz button on that band. S3 and C5 boards
+can coexist at 2.4 GHz, but 5.6 GHz is disabled unless every connected board is a
+known C5 because an S3 cannot follow the band change.
 
 **Labels name positions, not hardware.** If the boards are physically rearranged,
 update `LABEL` in `tools/capture.py` and the coordinates in `NOTES.md`. Getting this
@@ -134,6 +143,9 @@ docker compose run --rm csi bash -lc "cd /workspace/tools && python3 camera_prob
 # the GUI: live camera + 12 per-link CSI waterfalls, recording, scripted protocols
 docker compose run --rm -e QT_X11_NO_MITSHM=1 --name csi_live csi \
   bash -lc "cd /workspace/tools && exec python3 viewer.py --protocol /workspace/protocols/gergo_train.yaml"
+
+# macOS native GUI (uses the checked-out .venv_mac)
+.venv_mac/bin/python tools/viewer.py
 ```
 
 Only one process can own the serial ports at a time — stop the viewer before running
@@ -285,9 +297,10 @@ enumerate `/dev/ttyACM*` rather than assuming 0–3.
 **These are ordinary app-partition writes — reversible, no eFuse, no secure boot,
 no flash encryption.** Keep it that way.
 
-The target is pinned in `sdkconfig.defaults` (`CONFIG_IDF_TARGET="esp32s3"`), not in
-a generated `sdkconfig`; without it the project silently builds for plain esp32 and
-fails at link.
+The active target is pinned in `sdkconfig.defaults` (`CONFIG_IDF_TARGET="esp32c5"`),
+not in a generated `sdkconfig`; without it the project silently builds for plain
+esp32 and fails at link. Use `idf.py set-target esp32s3` before building for the
+original boards; the source keeps target-specific CSI and status-LED paths for both.
 
 Knobs at the top of `firmware/main/app_main.c`:
 
@@ -306,11 +319,12 @@ change; the table in `NOTES.md` records what each combination gave.
 `dependencies.lock` is tracked and `managed_components/` is not — `idf.py build`
 restores the components from the lock, which also pins their content hashes.
 
-Boards accept `TX`, `RX <mac>`, `RATE <hz>`, `SUB <n>`, `CHAN <n>`, `BW <20|40>`,
-`SCAN [ms]`, `IDENT`, `IDENT OFF`, `LED r,g,b` on the serial line and reply with
-`ROLE_TX` / `ROLE_RX,<mac>` / `RATE_OK,<hz>` / `CHAN_OK,<ch>,<bw>` / `BW_OK,<bw>,<ch>`
-/ `SCAN_CH,...` lines. `CHAN` and `BW` must be issued to every board together. CSI arrives
-as binary frames interleaved with those text lines on the same UART:
+Boards accept `TX`, `RX <mac>`, `RATE <hz>`, `SUB <n>`, `BAND <2.4|5.6>`, `CHAN <n>`,
+`BW <20|40>`, `SCAN [ms]`, `IDENT`, `IDENT OFF`, `LED r,g,b` on the serial line and
+reply with `ROLE_TX` / `ROLE_RX,<mac>` / `RATE_OK,<hz>` / `BAND_OK,<band>,<ch>,<bw>` /
+`CHAN_OK,<ch>,<bw>` / `BW_OK,<bw>,<ch>` / `SCAN_CH,...` lines. `BAND`, `CHAN`, and
+`BW` must be issued to every board together. CSI arrives as binary frames interleaved
+with those text lines on the same UART:
 
 ```
         v1 (amplitude)              v2 (I/Q)

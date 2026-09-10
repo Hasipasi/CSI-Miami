@@ -746,3 +746,32 @@ scored 99.6% TX / 99.2% RX. All same-pair asymmetries 1.0x for both. The two are
 statistically indistinguishable — the rig has a verified healthy spare for the
 first time. E keeps its own label so the NOTES suspicion stays attached to the
 silicon rather than the slot.
+
+## 2026-09-10 — two ESP32-C5 boards and 5.600 GHz
+
+Added two ESP32-C5-DevKitC-1 rev 1.2 boards: F
+(`10:bd:a3:e6:62:3c` / `5C94096576`) and G
+(`10:bd:a3:e6:37:f4` / `5C94096770`). Both run the same host-driven firmware.
+The C5 target needs the HE-era CSI acquisition structure and its onboard RGB LED
+is GPIO27 rather than the S3 board's GPIO48.
+
+`BAND 2.4` and `BAND 5.6` now switch every C5 between channel 13 and channel 120
+(5600 MHz). The Hungary regulatory domain is configured explicitly because channel
+120 is outside the world-safe channel mask. A two-board, 100 ping/s smoke test on
+the same directed link delivered 300/300 frames over three seconds on each band
+with zero bad binary frames.
+
+C5 CSI differs from the S3 layout: one HT-LTF is 117 complex subcarriers at HT40
+and 57 at HT20, rather than the S3's combined 192-value block. On 5.6 GHz the
+runtime band change is verified at HT20; asking the current C5/ESP-NOW stack to
+enter 5 GHz directly at HT40 leaves the peer on its old channel. The GUI therefore
+selects 20 MHz and disables 40 MHz while 5.6 GHz is active instead of silently
+claiming a width the radio did not use.
+
+The first runtime implementation used an 11n-only bitmap when returning to 2.4 GHz.
+`esp_wifi_set_protocols()` accepted and expanded that value during boot, but the
+single-band `esp_wifi_set_protocol()` call rejected it with `ESP_ERR_INVALID_ARG`,
+leaving the peer at channel 120. The transition now supplies the required b/g/n
+bitmap. A five-step 2.4 → 5.6 → 2.4 → 5.6 → 2.4 hardware test returned `BAND_OK`
+from both boards at every step and delivered 484–622 frames per two-second sample,
+with 117 subcarriers on 2.4 GHz and 57 on 5.6 GHz and zero bad binary frames.

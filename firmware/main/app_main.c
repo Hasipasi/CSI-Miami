@@ -36,9 +36,12 @@
      STATS              -- STATS,framedrops,textdrops,sendfail,heap. framedrops is
                             whole records dropped because the UART TX ring was full,
                             i.e. wire loss, distinguishable from radio loss.
-     CHAN <n>           -- move to 2.4 GHz channel n (1-13). Every board must be
-                            moved together, and at HT40 the pair n and its secondary
-                            are what is occupied.
+     BAND <2.4|5.6>     -- move every ESP32-C5 together between the 2.4 GHz boot
+                            channel and 5.6 GHz (channel 120). Older ESP32-S3 boards
+                            reject 5.6 because their radio is 2.4 GHz-only.
+     CHAN <n>           -- move to a channel in the current band. Every board must
+                            be moved together, and at HT40 the primary/secondary
+                            pair is what is occupied.
      BW <20|40>         -- radio bandwidth in MHz. 40 gives more subcarriers, 20
                             gives a span narrow enough to dodge a busy band. Move
                             every board together.
@@ -71,7 +74,11 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#if CONFIG_IDF_TARGET_ESP32C5
+#define STATUS_LED_GPIO 27
+#else
 #define STATUS_LED_GPIO 48
+#endif
 
 // 13, not the 11 this shipped with: 11 was inherited from Espressif's example and
 // never checked. Surveyed 2026-08-18 (SCAN, both boards pooled, three runs): ch13's
@@ -82,7 +89,17 @@
 // remains a runtime experiment via "BW 20" + "CHAN <n>" until the dataset builders
 // handle 128-wide frames.
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   13
+#define CONFIG_5G6_CHANNEL                120
 #define CONFIG_WIFI_BANDWIDTH               WIFI_BW_HT40
+#if CONFIG_IDF_TARGET_ESP32C5
+#define CONFIG_WIFI_BAND_MODE               WIFI_BAND_MODE_2G_ONLY
+// esp_wifi_set_protocols() treats 11N as a requested maximum and expands it to
+// b/g/n, but the single-band esp_wifi_set_protocol() used during a BAND transition
+// requires the complete valid 2.4 GHz chain. N-only is rejected with INVALID_ARG.
+#define CONFIG_WIFI_2G_PROTOCOL             (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G \
+                                             | WIFI_PROTOCOL_11N)
+#define CONFIG_WIFI_5G_PROTOCOL             (WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N)
+#endif
 #define CONFIG_ESP_NOW_PHYMODE              WIFI_PHY_MODE_HT40
 #define CONFIG_ESP_NOW_RATE                 WIFI_PHY_RATE_MCS0_LGI
 #define CONFIG_FORCE_GAIN                   0
@@ -241,7 +258,7 @@ static const uint8_t *sub_table(int n)
     return NULL;                      // 0 or anything unrecognised: send everything
 }
 
-#define CONFIG_GAIN_CONTROL                  1     // all our boards are ESP32-S3
+#define CONFIG_GAIN_CONTROL                  1     // supported by ESP32-S3 and ESP32-C5
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
@@ -414,20 +431,50 @@ static bool parse_hex_mac(const char *hex, uint8_t *out)
 // sits *below* the primary, so "channel 11" actually occupies 7-11 -- straight
 // across the two most crowded channels in a typical building.
 static volatile uint8_t cur_channel = CONFIG_LESS_INTERFERENCE_CHANNEL;
+static volatile uint8_t channel_2g = CONFIG_LESS_INTERFERENCE_CHANNEL;
+#if CONFIG_IDF_TARGET_ESP32C5
+static volatile uint8_t channel_5g = CONFIG_5G6_CHANNEL;
+#endif
 // Bandwidth is runtime state, not the compile-time macro it used to be. 40 MHz cannot
 // dodge a congested 2.4 GHz band -- 1/6/11 are 25 MHz apart, so every HT40 placement
 // overlaps at least one -- while 20 MHz can, at the cost of frequency diversity. That
 // is a trade to measure on the rig, and measuring it meant being able to switch
 // without a reflash between every data point.
 static volatile uint8_t cur_bw = (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT40) ? 40 : 20;
+static volatile uint8_t bandwidth_2g = (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT40) ? 40 : 20;
+#if CONFIG_IDF_TARGET_ESP32C5
+// The current C5/ESP-NOW driver produces valid 5 GHz CSI at HT20. Asking it to
+// change bands directly into HT40 leaves the peer on its old 2.4 GHz channel, so
+// make the verified mode explicit instead of claiming a width the radio did not use.
+static volatile uint8_t bandwidth_5g = 20;
+#endif
+
+static bool channel_is_2g(uint8_t ch)
+{
+    return ch >= 1 && ch <= 13;
+}
+
+#if CONFIG_IDF_TARGET_ESP32C5
+static bool channel_is_5g(uint8_t ch)
+{
+    return ((ch >= 36 && ch <= 64 && (ch - 36) % 4 == 0)
+            || (ch >= 100 && ch <= 144 && (ch - 100) % 4 == 0)
+            || (ch >= 149 && ch <= 177 && (ch - 149) % 4 == 0));
+}
+#endif
 
 static bool apply_channel(uint8_t ch)
 {
-    if (ch < 1 || ch > 13) {
+    bool on_2g = channel_is_2g(ch);
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (!on_2g && !channel_is_5g(ch)) {
+#else
+    if (!on_2g) {
+#endif
         return false;
     }
     wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
-    if (cur_bw == 40) {
+    if (cur_bw == 40 && on_2g) {
         // HT40 needs its second 20 MHz beside the primary and inside 1-13: below for
         // a high primary, above for a low one. The *pair* is what the rig occupies,
         // so it is the pair a survey has to be scored against.
@@ -437,6 +484,13 @@ static bool apply_channel(uint8_t ch)
         return false;
     }
     cur_channel = ch;
+    if (on_2g) {
+        channel_2g = ch;
+#if CONFIG_IDF_TARGET_ESP32C5
+    } else {
+        channel_5g = ch;
+#endif
+    }
     // The RF reference just moved: a gain baseline recorded on the old channel is
     // stale, so restart the 100-frame collection (no-op at boot when nothing has
     // been recorded yet).
@@ -458,29 +512,28 @@ static bool apply_channel(uint8_t ch)
     esp_now_peer_info_t peer = {0};
     if (esp_now_get_peer(BROADCAST_MAC, &peer) == ESP_OK) {
         peer.channel = ch;
-        esp_now_mod_peer(&peer);
+        if (esp_now_mod_peer(&peer) != ESP_OK) {
+            return false;
+        }
     }
     return true;
 }
 
-static bool apply_bandwidth(int mhz)
+static esp_err_t set_radio_bandwidth(wifi_bandwidth_t bw)
 {
-    if (mhz != 20 && mhz != 40) {
-        return false;
-    }
-    wifi_bandwidth_t bw = (mhz == 40) ? WIFI_BW_HT40 : WIFI_BW_HT20;
-    if (esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, bw) != ESP_OK) {
-        return false;
-    }
-    cur_bw = (uint8_t)mhz;
-    // Channel first, rate config second. The order matters going *up*: HT40 phymode
-    // needs the secondary channel to exist, and right after set_bandwidth the radio
-    // is still on the HT20 channel with no secondary -- the rate config call then
-    // fails and the board keeps transmitting HT20 frames while claiming HT40, which
-    // is exactly what happened (RX reported 128 subcarriers after BW 40).
-    apply_channel(cur_channel);
-    // ESP-NOW carries its own PHY mode. Left at HT20 while the radio is HT40, every
-    // transmission stays 20 MHz wide and the CSI silently loses half its span.
+#if CONFIG_IDF_TARGET_ESP32C5
+    wifi_bandwidths_t bandwidths = {
+        .ghz_2g = bw,
+        .ghz_5g = bw,
+    };
+    return esp_wifi_set_bandwidths(ESP_IF_WIFI_STA, &bandwidths);
+#else
+    return esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, bw);
+#endif
+}
+
+static bool apply_peer_rate(int mhz)
+{
     esp_now_rate_config_t rc = {
         .phymode = (mhz == 40) ? WIFI_PHY_MODE_HT40 : WIFI_PHY_MODE_HT20,
         .rate    = CONFIG_ESP_NOW_RATE,
@@ -491,6 +544,93 @@ static bool apply_bandwidth(int mhz)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "peer rate config (%d MHz): %s", mhz, esp_err_to_name(err));
         return false;
+    }
+    return true;
+}
+
+#if CONFIG_IDF_TARGET_ESP32C5
+static bool band_step_ok(const char *step, esp_err_t err)
+{
+    if (err == ESP_OK) {
+        return true;
+    }
+    ESP_LOGW(TAG, "band switch failed at %s: %s (0x%x)", step,
+             esp_err_to_name(err), (unsigned)err);
+    return false;
+}
+#endif
+
+static bool apply_band(int band)
+{
+    if (band == 24) {
+#if CONFIG_IDF_TARGET_ESP32C5
+        if (!band_step_ok("2g band mode",
+                          esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY))
+            || !band_step_ok("2g protocol",
+                             esp_wifi_set_protocol(ESP_IF_WIFI_STA,
+                                                   CONFIG_WIFI_2G_PROTOCOL))
+            || !band_step_ok("2g bandwidth",
+                             set_radio_bandwidth(bandwidth_2g == 40
+                                                 ? WIFI_BW_HT40 : WIFI_BW_HT20))) {
+            return false;
+        }
+        cur_bw = bandwidth_2g;
+#endif
+        return apply_channel(channel_2g) && apply_peer_rate(cur_bw);
+    }
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (band == 56) {
+        // This path deliberately selects the verified 20 MHz mode (see
+        // bandwidth_5g above) before moving the peer to the 5.6 GHz channel.
+        if (!band_step_ok("5g band mode",
+                          esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY))
+            || !band_step_ok("5g protocol",
+                             esp_wifi_set_protocol(ESP_IF_WIFI_STA,
+                                                   CONFIG_WIFI_5G_PROTOCOL))
+            || !band_step_ok("5g bandwidth", set_radio_bandwidth(WIFI_BW_HT20))) {
+            return false;
+        }
+        cur_bw = bandwidth_5g;
+        return apply_channel(channel_5g) && apply_peer_rate(cur_bw);
+    }
+#endif
+    return false;
+}
+
+static bool apply_bandwidth(int mhz)
+{
+    if (mhz != 20 && mhz != 40) {
+        return false;
+    }
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (!channel_is_2g(cur_channel) && mhz != 20) {
+        return false;
+    }
+#endif
+    wifi_bandwidth_t bw = (mhz == 40) ? WIFI_BW_HT40 : WIFI_BW_HT20;
+    if (set_radio_bandwidth(bw) != ESP_OK) {
+        return false;
+    }
+    cur_bw = (uint8_t)mhz;
+    // Channel first, rate config second. The order matters going *up*: HT40 phymode
+    // needs the secondary channel to exist, and right after set_bandwidth the radio
+    // is still on the HT20 channel with no secondary -- the rate config call then
+    // fails and the board keeps transmitting HT20 frames while claiming HT40, which
+    // is exactly what happened (RX reported 128 subcarriers after BW 40).
+    if (!apply_channel(cur_channel)) {
+        return false;
+    }
+    // ESP-NOW carries its own PHY mode. Left at HT20 while the radio is HT40, every
+    // transmission stays 20 MHz wide and the CSI silently loses half its span.
+    if (!apply_peer_rate(mhz)) {
+        return false;
+    }
+    if (channel_is_2g(cur_channel)) {
+        bandwidth_2g = (uint8_t)mhz;
+#if CONFIG_IDF_TARGET_ESP32C5
+    } else {
+        bandwidth_5g = (uint8_t)mhz;
+#endif
     }
     return true;
 }
@@ -533,7 +673,7 @@ static void do_scan(uint32_t dwell_ms)
     esp_wifi_set_promiscuous_rx_cb(promisc_rx_cb);
     // HT20 for the survey: a 40 MHz capture smears two channels into one number, and
     // comparing channels is the entire point.
-    esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, WIFI_BW_HT20);
+    set_radio_bandwidth(WIFI_BW_HT20);
 
     emit_textf("SCAN_BEGIN,%u\n", (unsigned)dwell_ms);
 
@@ -630,6 +770,22 @@ static void uart_command_task(void *arg)
             } else {
                 ESP_LOGW(TAG, "bad SUB command: '%s'", line);
             }
+        } else if (strncmp(line, "BAND ", 5) == 0) {
+            // BAND is intentionally one atomic firmware operation. If the host had
+            // to send a band change and a channel change separately, even a brief
+            // role-command handoff between them could leave part of the rig deaf.
+            int band = 0;
+            if (strcmp(line + 5, "2.4") == 0 || strcmp(line + 5, "2") == 0) {
+                band = 24;
+            } else if (strcmp(line + 5, "5.6") == 0 || strcmp(line + 5, "5") == 0) {
+                band = 56;
+            }
+            if (band && apply_band(band)) {
+                emit_textf("BAND_OK,%s,%u,%u\n", band == 24 ? "2.4" : "5.6",
+                           (unsigned)cur_channel, (unsigned)cur_bw);
+            } else {
+                ESP_LOGW(TAG, "unsupported BAND command: '%s'", line);
+            }
         } else if (strncmp(line, "BW ", 3) == 0) {
             // Every board must move together, exactly like CHAN: a board left at the
             // other bandwidth cannot decode the others at all.
@@ -640,8 +796,8 @@ static void uart_command_task(void *arg)
                 ESP_LOGW(TAG, "bad BW command: '%s'", line);
             }
         } else if (strncmp(line, "CHAN ", 5) == 0) {
-            // Every board must be moved together: a board left on the old channel
-            // hears nothing and looks like a dead serial link.
+            // Every board must move together: a board left on the old channel or
+            // band hears nothing and looks like a dead serial link.
             unsigned ch;
             if (sscanf(line + 5, "%u", &ch) == 1 && apply_channel((uint8_t)ch)) {
                 emit_textf("CHAN_OK,%u,%u\n", ch, (unsigned)cur_bw);
@@ -713,6 +869,11 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     }
 
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
+#if CONFIG_IDF_TARGET_ESP32C5
+    if (!rx_ctrl->rx_channel_estimate_info_vld) {
+        return;
+    }
+#endif
     float compensate_gain = 1.0f;
     esp_err_t comp_state = ESP_ERR_INVALID_STATE;
     static uint8_t agc_gain = 0;
@@ -863,8 +1024,24 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
+#if CONFIG_IDF_TARGET_ESP32C5
+    // The C5 is not simultaneously dual-band. Configure both sides up front, then
+    // BAND switches the one radio's active band and channel together at runtime. HU
+    // is explicit because channel 120 (5600 MHz) is outside the world-safe default
+    // mask; the driver remains responsible for the country's DFS restrictions.
+    ESP_ERROR_CHECK(esp_wifi_set_country_code("HU", false));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_band_mode(CONFIG_WIFI_BAND_MODE));
+    wifi_protocols_t protocols = {
+        .ghz_2g = CONFIG_WIFI_2G_PROTOCOL,
+        .ghz_5g = CONFIG_WIFI_5G_PROTOCOL,
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_protocols(ESP_IF_WIFI_STA, &protocols));
+    ESP_ERROR_CHECK(set_radio_bandwidth(CONFIG_WIFI_BANDWIDTH));
+#else
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, CONFIG_WIFI_BANDWIDTH));
     ESP_ERROR_CHECK(esp_wifi_start());
+#endif
 
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     // Through apply_channel so boot and "CHAN <n>" cannot drift apart on how the
@@ -883,7 +1060,7 @@ static void wifi_esp_now_init(void)
     ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
 
     esp_now_peer_info_t peer = {
-        .channel   = CONFIG_LESS_INTERFERENCE_CHANNEL,
+        .channel   = cur_channel,
         .ifidx     = WIFI_IF_STA,
         .encrypt   = false,
         .peer_addr = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
@@ -903,6 +1080,28 @@ static void wifi_csi_init(void)
 {
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
 
+#if CONFIG_IDF_TARGET_ESP32C5
+    // C5's HE-capable Wi-Fi driver uses the acquisition bitfield. ESP-NOW is kept
+    // on 11n/HT so one HT-LTF is returned: 57 values at HT20 or 117 at HT40. The
+    // older S3 driver can return LLTF + HT-LTF + STBC-HT-LTF in one 192-value block,
+    // hence its separate legacy structure below.
+    wifi_csi_config_t csi_config = {
+        .enable                 = true,
+        .acquire_csi_legacy     = true,
+        .acquire_csi_force_lltf = false,
+        .acquire_csi_ht20       = true,
+        .acquire_csi_ht40       = true,
+        .acquire_csi_vht        = false,
+        .acquire_csi_su         = false,
+        .acquire_csi_mu         = false,
+        .acquire_csi_dcm        = false,
+        .acquire_csi_beamformed = false,
+        .acquire_csi_he_stbc_mode = ESP_CSI_ACQUIRE_STBC_HELTF1,
+        .val_scale_cfg          = 0,
+        .dump_ack_en            = false,
+        .lltf_bit_mode          = 1,
+    };
+#else
     wifi_csi_config_t csi_config = {
         .lltf_en           = true,
         .htltf_en          = true,
@@ -912,6 +1111,7 @@ static void wifi_csi_init(void)
         .manu_scale        = false,
         .shift             = false,
     };
+#endif
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_rx_cb, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));

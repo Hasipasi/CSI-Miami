@@ -64,11 +64,11 @@ from PyQt5.Qt import *
 from PyQt5 import QtCore
 import pyqtgraph as pg
 
-from capture import (SUB_INDEX, CsiStream, JpegWriter, LABEL,
-                            default_camera_device, default_outdir, derive_fields,
-                            discover, field_bounds, open_camera, owner_of,
-                            parse_scan_line, rank_channels, resolve_prefix,
-                            write_capture)
+from capture import (C5_MACS, SUB_INDEX, CsiStream, JpegWriter, LABEL,
+                     default_camera_device, default_outdir, derive_fields,
+                     discover, field_bounds, open_camera, owner_of,
+                     parse_scan_line, rank_channels, resolve_prefix,
+                     write_capture)
 
 pg.setConfigOptions(imageAxisOrder='row-major')
 
@@ -344,6 +344,7 @@ class Live(QWidget):
         super().__init__()
         self.boards, self.cam, self.args = boards, cam, args
         self.macs = sorted(boards)
+        self.c5_rig = all(m in C5_MACS for m in self.macs)
         self.stop = threading.Event()
         self.t0 = time.time()
 
@@ -408,8 +409,11 @@ class Live(QWidget):
         self.fields = None
         self.fields_at = 0.0
         self.scan = None           # channel survey state, None when not scanning
+        self.band = '2.4'          # firmware always boots here; --band retunes below
+        self.channels = {'2.4': args.channel, '5.6': 120}
+        self.bandwidths = {'2.4': args.bw, '5.6': 20}
         self.bw = args.bw          # what the boards are believed to be running
-        self.sub_sel = 30          # GUI startup setting, applied to every board below
+        self.sub_sel = 0 if self.c5_rig else 30
         self.rate_val = 243        # firmware boot default (CONFIG_SEND_FREQUENCY)
         # CLOCK_MONOTONIC to wall clock, measured once: the two drift far too slowly
         # to matter across a run, and re-measuring per frame would inject exactly the
@@ -543,14 +547,30 @@ class Live(QWidget):
         self.sub_buttons = {}
         sub_group = QButtonGroup(self)
         sub_group.setExclusive(True)
-        for n, label in ((30, '30'), (114, '114'), (166, '166')):
+        sub_choices = ((0, 'ALL (C5)'),) if self.c5_rig else ((30, '30'), (114, '114'), (166, '166'))
+        for n, label in sub_choices:
             b = QPushButton(label)
             b.setCheckable(True)
             b.clicked.connect(lambda _c, k=n: self.set_sub(k))
             sub_group.addButton(b)
             setup_layout.addWidget(b)
             self.sub_buttons[n] = b
-        self.sub_buttons[30].setChecked(True)
+        self.sub_buttons[self.sub_sel].setChecked(True)
+        setup_layout.addWidget(QLabel('BAND'))
+        self.band_buttons = {}
+        band_group = QButtonGroup(self)
+        band_group.setExclusive(True)
+        for band in ('2.4', '5.6'):
+            b = QPushButton(f'{band} GHz')
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c, selected=band: self.set_band(selected))
+            if band == '5.6':
+                b.setToolTip('ESP32-C5 only · 5600 MHz primary (Wi-Fi channel 120)')
+                b.setEnabled(self.c5_rig)
+            band_group.addButton(b)
+            setup_layout.addWidget(b)
+            self.band_buttons[band] = b
+        self.band_buttons[args.band].setChecked(True)
         self.scan_btn = QPushButton('⚡ FIND BEST CHANNEL')
         self.scan_btn.setMinimumWidth(200)
         self.scan_btn.clicked.connect(self.start_scan)
@@ -709,6 +729,7 @@ class Live(QWidget):
         self.tx_sel = start
         self.tx_buttons[start].setChecked(True)
         self.arrange_panels()
+        self.set_band(args.band, force=True)
         self.set_sub(self.sub_sel)
         self.style_csi_button()
 
@@ -1326,6 +1347,8 @@ class Live(QWidget):
         rec['jpeg'].close()
         meta = dict(t0_epoch=rec['t0'], t0_epoch_ns=rec['t0_ns'], mode=self.tx_sel,
                     round_duration=self.args.round_duration,
+                    wifi_band_ghz=self.band, wifi_channel=self.channels[self.band],
+                    wifi_bandwidth_mhz=self.bw,
                     width=self.cam.w, height=self.cam.h, fps_requested=self.cam.fps,
                     frame_dir=f'{rec["prefix"]}_frames', jpeg_quality=self.args.quality,
                     boards={m: LABEL.get(m[-5:], '?') for m in self.macs},
@@ -1358,6 +1381,9 @@ class Live(QWidget):
         """
         if self.scan is not None:
             return
+        if self.band != '2.4':
+            self.rec_status.setText('switch to 2.4 GHz before running its channel survey')
+            return
         if self.rec is not None or self.proto is not None:
             self.rec_status.setText(
                 '<span style="color:#ff5555">stop the recording first — a survey '
@@ -1374,7 +1400,15 @@ class Live(QWidget):
 
     def reset_scan_button(self):
         if self.scan is None:
-            self.scan_btn.setText('⚡ FIND BEST CHANNEL')
+            self.refresh_scan_availability()
+
+    def refresh_scan_availability(self):
+        """The existing survey ranks 2.4 GHz channels 1-13 only."""
+        on_2g = self.band == '2.4'
+        self.scan_btn.setEnabled(on_2g and self.scan is None)
+        self.scan_btn.setText('⚡ FIND BEST CHANNEL' if on_2g else 'SCAN: 2.4 GHz ONLY')
+        self.scan_btn.setToolTip(
+            '' if on_2g else 'Switch to 2.4 GHz to survey channels 1-13.')
 
     def show_scan_result(self, text):
         self.scan_btn.setText(text)
@@ -1475,18 +1509,19 @@ class Live(QWidget):
         ranked = rank_channels(stats)
         best, best_bytes, best_rssi, span = ranked[0]
         self.show_scan_result(f'CH {best} FOUND')
-        cur = next((r for r in ranked if r[0] == self.args.channel), None)
+        current = self.channels['2.4']
+        cur = next((r for r in ranked if r[0] == current), None)
         # One line on screen; the full per-channel table goes to stdout below, where
         # it can be scrolled back rather than crowding the controls.
-        moved = best != self.args.channel
+        moved = best != current
         if timed_out:
             verdict = '<b style="color:#fbbf24">survey timed out</b> — all boards on SCAN firmware?'
         elif cur and cur[1] > best_bytes:
             pct = 100.0 * (cur[1] - best_bytes) / max(cur[1], 1)
             verdict = (f'⚡ <b>ch{best}</b> · {pct:.0f}% less airtime than '
-                       f'ch{self.args.channel}' + (' · moving' if moved else ''))
+                       f'ch{current}' + (' · moving' if moved else ''))
         else:
-            verdict = f'⚡ <b>ch{self.args.channel}</b> already best'
+            verdict = f'⚡ <b>ch{current}</b> already best'
         self.scan_label.setText(verdict)
         # Move only on a meaningful win: your last survey ranked the top five
         # placements within 1.5% of each other -- a statistical tie -- and moving
@@ -1495,12 +1530,12 @@ class Live(QWidget):
             pct = 100.0 * (cur[1] - best_bytes) / max(cur[1], 1)
             if pct < 5.0:
                 self.scan_label.setText(
-                    f'⚡ <b>ch{self.args.channel}</b> kept — best alternative ch{best} '
+                    f'⚡ <b>ch{current}</b> kept — best alternative ch{best} '
                     f'is only {pct:.0f}% better (tie)')
                 return
         print(f'channel survey: best={best} span={span[0]}-{span[-1]} bytes={best_bytes} '
               f'rssi={best_rssi}; ranked={[(r[0], r[1]) for r in ranked[:5]]}', flush=True)
-        if best != self.args.channel:
+        if best != current:
             self.set_channel(best)
 
     def busy_reason(self):
@@ -1517,6 +1552,10 @@ class Live(QWidget):
         the 30/166 tables index up to subcarrier 190, which does not exist in a
         128-wide HT20 report, so the firmware sends everything instead."""
         sel = self.sub_sel if sel is None else sel
+        if sel == self.sub_sel and self.n_sub:
+            return self.n_sub
+        if self.c5_rig:
+            return 57 if self.bw == 20 else 117
         if self.bw == 20:
             return 128
         return {30: 30, 114: 114, 166: 166, 0: 192}[sel]
@@ -1591,7 +1630,8 @@ class Live(QWidget):
         why = self.busy_reason()
         if why:
             self.rec_status.setText(f'<span style="color:#ff5555">{why}</span>')
-            self.sub_buttons[self.sub_sel if self.sub_sel in self.sub_buttons else 30].setChecked(True)
+            selected = self.sub_sel if self.sub_sel in self.sub_buttons else next(iter(self.sub_buttons))
+            self.sub_buttons[selected].setChecked(True)
             return
         ok = True
         for m in self.macs:
@@ -1607,6 +1647,46 @@ class Live(QWidget):
                 f'(wire ceiling {self.wire_ceiling()} Hz)')
             self.recalibrate()
 
+    def set_band(self, want, force=False):
+        """Move the whole C5 rig between 2.4 GHz and channel 120 (5.6 GHz)."""
+        if want not in self.band_buttons:
+            return False
+        if want == '5.6' and not self.c5_rig:
+            self.rec_status.setText(
+                '<span style="color:#ff5555">5.6 GHz requires an all-ESP32-C5 rig.</span>')
+            self.band_buttons[self.band].setChecked(True)
+            return False
+        if want == self.band:
+            self.band_buttons[want].setChecked(True)
+            self.refresh_scan_availability()
+            return True
+        why = self.busy_reason()
+        if why and not force:
+            self.rec_status.setText(f'<span style="color:#ff5555">{why}</span>')
+            self.band_buttons[self.band].setChecked(True)
+            return False
+        ok = True
+        for m in self.macs:
+            try:
+                self.boards[m].write(f'BAND {want}\n'.encode())
+            except (serial.SerialException, OSError):
+                ok = False
+        if not ok:
+            self.band_buttons[self.band].setChecked(True)
+            return False
+        self.band = want
+        self.bw = self.bandwidths[want]
+        self.band_buttons[want].setChecked(True)
+        self.bw_buttons[self.bw].setChecked(True)
+        self.bw_buttons[40].setEnabled(want == '2.4')
+        self.bw_buttons[40].setToolTip(
+            '' if want == '2.4' else 'The verified ESP32-C5 5.6 GHz CSI mode is 20 MHz.')
+        self.refresh_scan_availability()
+        self.recalibrate()
+        self.rec_status.setText(
+            f'band → {want} GHz · channel {self.channels[want]} · {self.bw} MHz')
+        return True
+
     def set_bw(self, want):
         """Set the whole rig to 20 or 40 MHz.
 
@@ -1616,6 +1696,12 @@ class Live(QWidget):
         A recording's frames say which was active (n_sub 128 against 166/192).
         """
         if want == self.bw:
+            return
+        if self.band == '5.6' and want != 20:
+            self.rec_status.setText(
+                '<span style="color:#ff5555">5.6 GHz uses the verified 20 MHz C5 '
+                'CSI mode.</span>')
+            self.bw_buttons[self.bw].setChecked(True)
             return
         why = self.busy_reason()
         if why:
@@ -1632,6 +1718,7 @@ class Live(QWidget):
             self.bw_buttons[self.bw].setChecked(True)
             return
         self.bw = want
+        self.bandwidths[self.band] = want
         self.apply_rate_preset()
         # The subcarrier layout just changed: stale columns and a mean built on the
         # old width would both mislead, and the field split must be re-derived.
@@ -1648,6 +1735,7 @@ class Live(QWidget):
             for k in self.buf:
                 self.buf[k].clear()
         self.amp_mean, self.fields = None, None
+        self.n_sub = 0
         self.fields_at = 0.0
         self.seen_min = self.seen_max = None
         self.link_scale.clear()
@@ -1663,7 +1751,7 @@ class Live(QWidget):
             except (serial.SerialException, OSError):
                 ok = False
         if ok:
-            self.args.channel = ch
+            self.channels[self.band] = ch
             self.recalibrate()
         return ok
 
@@ -1958,11 +2046,14 @@ class Live(QWidget):
         if not self.csi_on:
             self.role.setText('<b style="color:#ff9d3b">■ CSI stopped</b> — START CSI resumes')
         elif active_tx is None:
-            self.role.setText(f'<b>round-robin</b> · {len(self.panels)} links')
+            self.role.setText(
+                f'<b>round-robin</b> · {len(self.panels)} links · '
+                f'{self.band} GHz ch{self.channels[self.band]} · {self.bw} MHz')
         else:
             rx = ', '.join(sorted(l for l in self.by_label if l != sel))
             self.role.setText(f'<b>TX {sel} → {rx}</b> · {len(self.macs) - 1} of '
-                              f'{len(self.panels)} links live')
+                              f'{len(self.panels)} links live · {self.band} GHz '
+                              f'ch{self.channels[self.band]} · {self.bw} MHz')
 
         silent = self.silent_boards(now)
         if silent:
@@ -2115,11 +2206,13 @@ def main():
     ap.add_argument('--refresh', type=float, default=30.0, help='GUI redraw rate (Hz)')
     ap.add_argument('--bw', type=int, default=40, choices=(20, 40),
                     help='the bandwidth the firmware boots on (CONFIG_WIFI_BANDWIDTH)')
+    ap.add_argument('--band', default='2.4', choices=('2.4', '5.6'),
+                    help='initial radio selection; 5.6 requires ESP32-C5 boards')
     ap.add_argument('--channel', type=int, default=13,
                     help='the 2.4 GHz channel the firmware boots on, so the survey can '
                          'say what a move would gain (CONFIG_LESS_INTERFERENCE_CHANNEL)')
     ap.add_argument('--tx', default='round-robin',
-                    help='"round-robin", or a board label (A/B/C/D) to pin the '
+                    help='"round-robin", or a discovered board label to pin the '
                          'transmitter. Switchable in the GUI at any time.')
     ap.add_argument('--round-duration', type=float, default=0.025,
                     help='seconds each board holds the transmit token; sets the blind '
@@ -2164,13 +2257,19 @@ def main():
     labels = [LABEL.get(m[-5:], m) for m in sorted(boards)]
     n_links = len(boards) * (len(boards) - 1)
     print(f'{len(boards)} boards: {labels} -> {n_links} links', flush=True)
-    if len(boards) < len(LABEL):
+    if all(m in C5_MACS for m in boards):
+        expected = {'F', 'G'}
+    elif all(m not in C5_MACS for m in boards):
+        expected = {'A', 'B', 'C', 'D'}
+    else:
+        expected = None
+    missing = sorted(expected - set(labels)) if expected else []
+    if missing:
         # Missing boards are silent in the panels -- they simply are not drawn -- and
         # a short session recorded without noticing is exactly the failure the health
         # banner exists to prevent. Say it once, up front, where it cannot be missed.
-        missing = sorted(set(LABEL.values()) - set(labels))
         print(f'note: {", ".join(missing)} not connected; recording {n_links} of '
-              f'{len(LABEL) * (len(LABEL) - 1)} links', flush=True)
+              f'{len(expected) * (len(expected) - 1)} links', flush=True)
 
     cam = open_camera(dev, args.width, args.height, args.fps)
     print(f'camera {cam.name} {cam.w}x{cam.h} @ {cam.fps:g} fps', flush=True)
