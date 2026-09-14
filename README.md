@@ -24,12 +24,15 @@ tooling auto-discovers.
 | D | `14:c1:9f:c1:2d:a8` | 5C39020696 |
 | F | `10:bd:a3:e6:62:3c` | 5C94096576 |
 | G | `10:bd:a3:e6:37:f4` | 5C94096770 |
+| H | `10:bd:a3:e6:38:14` | 5C94096765 |
+| I | `10:bd:a3:e6:38:24` | 5C94096766 |
 
-F/G are ESP32-C5 boards. An all-C5 rig can switch live between 2.4 GHz channel 13
-and 5.600 GHz channel 120 from the GUI. The verified C5 5.6 GHz CSI mode is HT20;
-the GUI selects 20 MHz and disables its 40 MHz button on that band. S3 and C5 boards
-can coexist at 2.4 GHz, but 5.6 GHz is disabled unless every connected board is a
-known C5 because an S3 cannot follow the band change.
+F/G/H/I are ESP32-C5 boards. An all-C5 rig can switch live between 2.4 GHz channel 13
+and 5.600 GHz channel 120 from the GUI. Both HT20 (57 complex subcarriers) and HT40
+(117) are verified on C5 at 5.6 GHz. The firmware enters 5 GHz through HT20 before
+widening because a direct band+HT40 transition leaves the ESP-NOW peer behind. S3 and
+C5 boards can coexist at 2.4 GHz, but 5.6 GHz is disabled unless every connected board
+is a known C5 because an S3 cannot follow the band change.
 
 **Labels name positions, not hardware.** If the boards are physically rearranged,
 update `LABEL` in `tools/capture.py` and the coordinates in `NOTES.md`. Getting this
@@ -254,10 +257,15 @@ and re-measure the same thing.
 carry a `tx|rx|iq` array alongside, and it is currently ignored — silently, so this
 is worth knowing before concluding that phase did not help.
 
-**UART bandwidth is the binding constraint on sample rate**, not the radio. At
-921600 8N1 the link carries 92.2 KB/s. Bandwidth arithmetic is necessary but not
+**UART bandwidth is the binding constraint on sample rate**, not the radio. The
+current C5 rig runs at 3 Mbaud 8N1, carrying 300 KB/s per board; the original S3
+measurements used 921600 baud (92.2 KB/s). Bandwidth arithmetic is necessary but not
 sufficient: 100 Hz on the older CSV encoding fit on paper and still corrupted lines,
 because `ets_printf` blocks on a full TX FIFO and starves the UART command task.
+At 5.6 GHz HT40, four-board round-robin is verified through 1200 ping/s: 300 Hz per
+directed link and 77.5% on the busiest UART. The GUI rate buttons are per-link targets
+(`100`, `200`, `300`); round-robin multiplies by the board count before commanding the
+firmware, while fixed-TX sends the displayed rate directly.
 
 The binary encoding removed that failure rather than just moving it. Swept on real
 hardware, **corruption was zero at every rate tried, for both subcarrier sets, right

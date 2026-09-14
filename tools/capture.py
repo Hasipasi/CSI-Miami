@@ -54,13 +54,16 @@ import serial.tools.list_ports
 from PIL import Image
 
 WCH_VID = 0x1A86
-BAUD = 921600
+BAUD = 3_000_000
 BOOT_MAC_RE = re.compile(r'Board MAC ([0-9a-fA-F:]{17})')
 N_META = 25
 TS_FIELD = 18                      # local_timestamp, microseconds, per the firmware header
 RSSI_FIELD = 3
 TS_WRAP = 1 << 32                  # the board counter is 32-bit microseconds
-C5_MACS = {'10:bd:a3:e6:62:3c', '10:bd:a3:e6:37:f4'}
+C5_MACS = {
+    '10:bd:a3:e6:62:3c', '10:bd:a3:e6:37:f4',
+    '10:bd:a3:e6:38:14', '10:bd:a3:e6:38:24',
+}
 
 # 'E' is the returned fifth board (ec:da:3b:4c:b8:d0 / 5C39018759). Its documented
 # RX fault (11x same-pair asymmetry) did NOT reproduce on the 2026-08-24 matrix
@@ -69,9 +72,9 @@ C5_MACS = {'10:bd:a3:e6:62:3c', '10:bd:a3:e6:37:f4'}
 # NOTES.md stays attached to this silicon, not to whatever slot it occupies.
 LABEL = {
     '2d:3c': 'A', '6b:5c': 'B', 'ab:d4': 'C', '2d:a8': 'D', 'b8:d0': 'E',
-    # ESP32-C5-DevKitC-1 boards added 2026-09-10. Keep distinct labels so the
+    # ESP32-C5-DevKitC-1 boards. Keep distinct labels so the
     # original S3 hardware can be connected at the same time without collisions.
-    '62:3c': 'F', '37:f4': 'G',
+    '62:3c': 'F', '37:f4': 'G', '38:14': 'H', '38:24': 'I',
 }
 
 # ------------------------------------------------------------ subcarrier layout

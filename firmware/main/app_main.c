@@ -108,7 +108,8 @@
 // the CSV this replaced.
 //
 // The number that matters is burst load -- a receiver sees the full ping rate while
-// its transmitter holds the token. 243 Hz x 354 B = 86.0 KB/s of the 92.2 KB/s link.
+// its transmitter holds the token. At the former 921600 baud, 243 Hz x 354 B used
+// 86.0 KB/s of the 92.2 KB/s link.
 //
 // 243 is the measured knee minus 10%. The knee differs by subcarrier set, and for two
 // different reasons, which is worth knowing before changing either:
@@ -443,9 +444,9 @@ static volatile uint8_t channel_5g = CONFIG_5G6_CHANNEL;
 static volatile uint8_t cur_bw = (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT40) ? 40 : 20;
 static volatile uint8_t bandwidth_2g = (CONFIG_WIFI_BANDWIDTH == WIFI_BW_HT40) ? 40 : 20;
 #if CONFIG_IDF_TARGET_ESP32C5
-// The current C5/ESP-NOW driver produces valid 5 GHz CSI at HT20. Asking it to
-// change bands directly into HT40 leaves the peer on its old 2.4 GHz channel, so
-// make the verified mode explicit instead of claiming a width the radio did not use.
+// Always enter 5 GHz through HT20. A direct band+HT40 transition left the ESP-NOW
+// peer on 2.4 GHz in testing; once the radio is established on 5 GHz, BW 40 can
+// widen it as a separate operation.
 static volatile uint8_t bandwidth_5g = 20;
 #endif
 
@@ -474,11 +475,22 @@ static bool apply_channel(uint8_t ch)
         return false;
     }
     wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
-    if (cur_bw == 40 && on_2g) {
-        // HT40 needs its second 20 MHz beside the primary and inside 1-13: below for
-        // a high primary, above for a low one. The *pair* is what the rig occupies,
-        // so it is the pair a survey has to be scored against.
-        sec = (ch >= 5) ? WIFI_SECOND_CHAN_BELOW : WIFI_SECOND_CHAN_ABOVE;
+    if (cur_bw == 40) {
+        if (on_2g) {
+            // HT40 needs its second 20 MHz beside the primary and inside 1-13: below
+            // for a high primary, above for a low one.
+            sec = (ch >= 5) ? WIFI_SECOND_CHAN_BELOW : WIFI_SECOND_CHAN_ABOVE;
+#if CONFIG_IDF_TARGET_ESP32C5
+        } else if (ch <= 144) {
+            // Standard 5 GHz HT40 pairs alternate above/below every 20 MHz channel.
+            // Channel 120 therefore pairs with 116 (secondary below).
+            sec = (((ch - 36) / 4) % 2 == 0)
+                ? WIFI_SECOND_CHAN_ABOVE : WIFI_SECOND_CHAN_BELOW;
+        } else {
+            sec = (((ch - 149) / 4) % 2 == 0)
+                ? WIFI_SECOND_CHAN_ABOVE : WIFI_SECOND_CHAN_BELOW;
+#endif
+        }
     }
     if (esp_wifi_set_channel(ch, sec) != ESP_OK) {
         return false;
@@ -560,6 +572,8 @@ static bool band_step_ok(const char *step, esp_err_t err)
 }
 #endif
 
+static bool apply_bandwidth(int mhz);
+
 static bool apply_band(int band)
 {
     if (band == 24) {
@@ -580,8 +594,8 @@ static bool apply_band(int band)
     }
 #if CONFIG_IDF_TARGET_ESP32C5
     if (band == 56) {
-        // This path deliberately selects the verified 20 MHz mode (see
-        // bandwidth_5g above) before moving the peer to the 5.6 GHz channel.
+        // Establish the band in verified HT20 first. If HT40 was selected earlier,
+        // widen only after the peer is already alive on channel 120.
         if (!band_step_ok("5g band mode",
                           esp_wifi_set_band_mode(WIFI_BAND_MODE_5G_ONLY))
             || !band_step_ok("5g protocol",
@@ -590,8 +604,11 @@ static bool apply_band(int band)
             || !band_step_ok("5g bandwidth", set_radio_bandwidth(WIFI_BW_HT20))) {
             return false;
         }
-        cur_bw = bandwidth_5g;
-        return apply_channel(channel_5g) && apply_peer_rate(cur_bw);
+        cur_bw = 20;
+        if (!apply_channel(channel_5g) || !apply_peer_rate(20)) {
+            return false;
+        }
+        return bandwidth_5g == 40 ? apply_bandwidth(40) : true;
     }
 #endif
     return false;
@@ -602,11 +619,7 @@ static bool apply_bandwidth(int mhz)
     if (mhz != 20 && mhz != 40) {
         return false;
     }
-#if CONFIG_IDF_TARGET_ESP32C5
-    if (!channel_is_2g(cur_channel) && mhz != 20) {
-        return false;
-    }
-#endif
+    uint8_t old_bw = cur_bw;
     wifi_bandwidth_t bw = (mhz == 40) ? WIFI_BW_HT40 : WIFI_BW_HT20;
     if (set_radio_bandwidth(bw) != ESP_OK) {
         return false;
@@ -618,12 +631,12 @@ static bool apply_bandwidth(int mhz)
     // fails and the board keeps transmitting HT20 frames while claiming HT40, which
     // is exactly what happened (RX reported 128 subcarriers after BW 40).
     if (!apply_channel(cur_channel)) {
-        return false;
+        goto rollback;
     }
     // ESP-NOW carries its own PHY mode. Left at HT20 while the radio is HT40, every
     // transmission stays 20 MHz wide and the CSI silently loses half its span.
     if (!apply_peer_rate(mhz)) {
-        return false;
+        goto rollback;
     }
     if (channel_is_2g(cur_channel)) {
         bandwidth_2g = (uint8_t)mhz;
@@ -633,6 +646,15 @@ static bool apply_bandwidth(int mhz)
 #endif
     }
     return true;
+
+rollback:
+    // Never leave one board claiming a width its radio or ESP-NOW peer rejected.
+    // The host also rolls the whole rig back if it misses BW_OK from any board.
+    set_radio_bandwidth(old_bw == 40 ? WIFI_BW_HT40 : WIFI_BW_HT20);
+    cur_bw = old_bw;
+    apply_channel(cur_channel);
+    apply_peer_rate(old_bw);
+    return false;
 }
 
 // ---- channel survey

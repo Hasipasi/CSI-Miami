@@ -30,7 +30,7 @@ import serial
 import serial.tools.list_ports
 
 WCH_VID = 0x1A86
-BAUD = 921600
+BAUD = 3_000_000
 BOOT_MAC_RE = re.compile(r'Board MAC ([0-9a-fA-F:]{17})')
 
 # Physical placement, established by lighting each board and asking. Update this
@@ -43,6 +43,8 @@ LABEL = {
     '14:c1:9f:c1:2d:a8': 'D',
     '10:bd:a3:e6:62:3c': 'F',
     '10:bd:a3:e6:37:f4': 'G',
+    '10:bd:a3:e6:38:14': 'H',
+    '10:bd:a3:e6:38:24': 'I',
 }
 
 

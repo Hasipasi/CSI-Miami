@@ -64,7 +64,7 @@ from PyQt5.Qt import *
 from PyQt5 import QtCore
 import pyqtgraph as pg
 
-from capture import (C5_MACS, SUB_INDEX, CsiStream, JpegWriter, LABEL,
+from capture import (BAUD, C5_MACS, SUB_INDEX, CsiStream, JpegWriter, LABEL,
                      default_camera_device, default_outdir, derive_fields,
                      discover, field_bounds, open_camera, owner_of,
                      parse_scan_line, rank_channels, resolve_prefix,
@@ -346,6 +346,11 @@ class Live(QWidget):
         self.macs = sorted(boards)
         self.c5_rig = all(m in C5_MACS for m in self.macs)
         self.stop = threading.Event()
+        self.command_lock = threading.Lock()
+        self.band_condition = threading.Condition()
+        self.band_replies = {}
+        self.bw_condition = threading.Condition()
+        self.bw_replies = {}
         self.t0 = time.time()
 
         # (t, amp) per ordered link, only ever holding the visible window
@@ -529,15 +534,15 @@ class Live(QWidget):
         self.rate_buttons = {}
         rate_group = QButtonGroup(self)
         rate_group.setExclusive(True)
-        for hz in (300, 600, 900):
+        for hz in (100, 200, 300):
             b = QPushButton(str(hz))
             b.setCheckable(True)
             b.clicked.connect(lambda _c, rate=hz: self.pick_rate_preset(rate))
             rate_group.addButton(b)
             setup_layout.addWidget(b)
             self.rate_buttons[hz] = b
-        self.rate_preset = 300
-        self.rate_buttons[300].setChecked(True)
+        self.rate_preset = 100
+        self.rate_buttons[100].setChecked(True)
 
         self.csi_btn = QPushButton('■ STOP CSI')
         self.csi_btn.setMinimumWidth(147)
@@ -729,13 +734,14 @@ class Live(QWidget):
         self.tx_sel = start
         self.tx_buttons[start].setChecked(True)
         self.arrange_panels()
-        self.set_band(args.band, force=True)
-        self.set_sub(self.sub_sel)
-        self.style_csi_button()
-
         for m in self.macs:
             boards[m].reset_input_buffer()
             threading.Thread(target=self.reader, args=(m,), daemon=True).start()
+        self.set_band(args.band, force=True)
+        if args.band == '5.6' and args.bw == 40:
+            self.set_bw(40)
+        self.set_sub(self.sub_sel)
+        self.style_csi_button()
         threading.Thread(target=self.radio, daemon=True).start()
         self.cam.start()
         threading.Thread(target=self.grabber, daemon=True).start()
@@ -1098,6 +1104,14 @@ class Live(QWidget):
                     t = ln.decode(errors='ignore').strip()
                     if t.startswith('STATS,'):
                         self.on_stats_line(rx, t)
+                    elif t.startswith('BAND_OK,'):
+                        with self.band_condition:
+                            self.band_replies[rx] = t
+                            self.band_condition.notify_all()
+                    elif t.startswith('BW_OK,'):
+                        with self.bw_condition:
+                            self.bw_replies[rx] = t
+                            self.bw_condition.notify_all()
                     elif self.scan is not None:
                         self.on_scan_line(rx, t)
                 now = time.time()
@@ -1228,14 +1242,13 @@ class Live(QWidget):
             self.rec_status.setText(f'<span style="color:#d03b3b">protocol: {e}</span>')
             return
         self.proto = dict(timing=timing, takes=takes, i=0, phase=LEAD,
-                          until=time.time() + timing['lead_in'], record_rate_armed=False)
+                          until=time.time() + timing['lead_in'])
         self.cue = Cue()
         self.cue.show()
         self.cue.raise_()
         self.proto_btn.setText('■ ABORT')
         self.rec_btn.setEnabled(False)
         self.prefix_edit.setEnabled(False)
-        self.apply_protocol_idle_rate()
         self.proto_tick()
 
     def abort_protocol(self, why, keep_cue=False):
@@ -1276,19 +1289,12 @@ class Live(QWidget):
         name, instruction = p['takes'][p['i']]
         left = p['until'] - now
 
-        # Let the boards return to the selected capture rate before timestamps enter
-        # the take, while still giving them nearly all of each lead-in and gap to rest.
-        if p['phase'] == LEAD and not p['record_rate_armed'] and left <= 1.0:
-            self.apply_rate_preset(force=True)
-            p['record_rate_armed'] = True
-
         if left <= 0:
             if p['phase'] == LEAD:
                 self.start_record(f'{self.session_dir()}/{name}')
                 p['phase'], p['until'] = REC, now + t['duration']
             elif p['phase'] == REC:
                 self.stop_record()
-                self.apply_protocol_idle_rate()
                 p['phase'], p['until'] = GAP, now + t['gap']
             else:
                 p['i'] += 1
@@ -1296,7 +1302,6 @@ class Live(QWidget):
                     return self.abort_protocol(
                         f'finished — {len(p["takes"])} takes written')
                 p['phase'], p['until'] = LEAD, now + t['lead_in']
-                p['record_rate_armed'] = False
             name, instruction = p['takes'][p['i']]
             left = p['until'] - now
 
@@ -1567,26 +1572,22 @@ class Live(QWidget):
         RATE 1600 round-robin on 2 boards sustains ~93% where pinned saturates at
         1071. The firmware itself caps RATE at 2000."""
         per_frame = 26 + 2 * self.frame_width(sel)             # v3: 24 hdr + 2 sum
-        ceil = 92160 / per_frame
+        ceil = (BAUD / 10) / per_frame
         if self.tx_sel == 'round-robin' and len(self.macs) > 1:
             ceil *= len(self.macs) / (len(self.macs) - 1)
         return min(int(ceil), 2000)
 
+    def link_wire_ceiling(self, sel=None):
+        """Wire ceiling in the per-link units shown on the rate buttons."""
+        ceil = self.wire_ceiling(sel)
+        return ceil // len(self.macs) if self.tx_sel == 'round-robin' else ceil
+
     def preset_hz(self, key):
-        return int(key)
-
-    def protocol_idle_hz(self):
-        """Temporary protocol rest rate: 25 Hz per RR link, 100 Hz pinned."""
-        return 25 * len(self.macs) if self.tx_sel == 'round-robin' else 100
-
-    def apply_protocol_idle_rate(self):
-        """Lower the rate between takes without changing the selected preset."""
-        self.send_rate(self.protocol_idle_hz())
+        return int(key * len(self.macs) if self.tx_sel == 'round-robin' else key * 3)
 
     def refresh_rate_buttons(self):
-        divisor = len(self.macs) if self.tx_sel == 'round-robin' else 1
         for key, b in self.rate_buttons.items():
-            b.setText(str(key // divisor))
+            b.setText(str(key if self.tx_sel == 'round-robin' else key * 3))
 
     def pick_rate_preset(self, key):
         why = self.busy_reason()
@@ -1604,8 +1605,11 @@ class Live(QWidget):
             return                       # never retune mid-take
         hz = self.preset_hz(self.rate_preset)
         if self.send_rate(hz) and announce:
+            shown = self.rate_preset if self.tx_sel == 'round-robin' else hz
+            unit = 'Hz/link' if self.tx_sel == 'round-robin' else 'Hz TX'
             self.rec_status.setText(
-                f'rate → {hz} Hz · wire ceiling {self.wire_ceiling()} Hz here')
+                f'rate → {shown} {unit} · firmware {hz} Hz · '
+                f'wire ceiling {self.link_wire_ceiling()} Hz/link')
 
     def send_rate(self, hz):
         ok = True
@@ -1642,9 +1646,12 @@ class Live(QWidget):
         if ok:
             self.sub_sel = n
             self.apply_rate_preset()
+            shown = self.rate_preset if self.tx_sel == 'round-robin' else self.rate_val
+            unit = 'Hz/link' if self.tx_sel == 'round-robin' else 'Hz TX'
             self.rec_status.setText(
-                f'subcarriers → {self.frame_width()} · rate → {self.rate_val} Hz '
-                f'(wire ceiling {self.wire_ceiling()} Hz)')
+                f'subcarriers → {self.frame_width()} · rate → '
+                f'{shown} {unit} (wire ceiling '
+                f'{self.link_wire_ceiling()} Hz/link)')
             self.recalibrate()
 
     def set_band(self, want, force=False):
@@ -1665,27 +1672,53 @@ class Live(QWidget):
             self.rec_status.setText(f'<span style="color:#ff5555">{why}</span>')
             self.band_buttons[self.band].setChecked(True)
             return False
-        ok = True
-        for m in self.macs:
-            try:
-                self.boards[m].write(f'BAND {want}\n'.encode())
-            except (serial.SerialException, OSError):
-                ok = False
-        if not ok:
+        previous = self.band
+        expected = f'BAND_OK,{want},{self.channels[want]},{self.bandwidths[want]}'
+        with self.command_lock:
+            replies = self.send_band(want)
+            confirmed = {m for m, reply in replies.items() if reply == expected}
+            if len(confirmed) != len(self.macs):
+                # A partial retune leaves the rig split across bands and therefore
+                # completely deaf. Put every board back before returning control.
+                self.send_band(previous)
+        if len(confirmed) != len(self.macs):
+            failed = ', '.join(LABEL.get(m[-5:], m[-5:])
+                               for m in self.macs if m not in confirmed)
+            self.rec_status.setText(
+                f'<span style="color:#ff5555">band switch failed on {failed}; '
+                f'rolled back to {previous} GHz</span>')
             self.band_buttons[self.band].setChecked(True)
             return False
         self.band = want
         self.bw = self.bandwidths[want]
         self.band_buttons[want].setChecked(True)
         self.bw_buttons[self.bw].setChecked(True)
-        self.bw_buttons[40].setEnabled(want == '2.4')
+        self.bw_buttons[40].setEnabled(True)
         self.bw_buttons[40].setToolTip(
-            '' if want == '2.4' else 'The verified ESP32-C5 5.6 GHz CSI mode is 20 MHz.')
+            '' if want == '2.4' else 'Experimental ESP32-C5 HT40 on channels 116+120.')
         self.refresh_scan_availability()
         self.recalibrate()
         self.rec_status.setText(
             f'band → {want} GHz · channel {self.channels[want]} · {self.bw} MHz')
         return True
+
+    def send_band(self, want):
+        """Send one rig-wide band transition and collect firmware acknowledgements."""
+        with self.band_condition:
+            self.band_replies = {}
+        for m in self.macs:
+            try:
+                self.boards[m].write(f'BAND {want}\n'.encode())
+            except (serial.SerialException, OSError):
+                continue
+        deadline = time.monotonic() + 1.5
+        with self.band_condition:
+            while len(self.band_replies) < len(self.macs):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.band_condition.wait(remaining)
+            return dict(self.band_replies)
 
     def set_bw(self, want):
         """Set the whole rig to 20 or 40 MHz.
@@ -1693,36 +1726,59 @@ class Live(QWidget):
         Neither is simply better: 40 MHz carries more
         subcarriers, 20 MHz is narrow enough to escape a congested band entirely --
         measured here, HT20 on a quiet channel delivered 99.7% against HT40's 91%.
-        A recording's frames say which was active (n_sub 128 against 166/192).
+        A recording's frames say which was active: C5 reports 57 at HT20 and 117 at
+        HT40; S3 reports 128 against 166/192.
         """
         if want == self.bw:
-            return
-        if self.band == '5.6' and want != 20:
-            self.rec_status.setText(
-                '<span style="color:#ff5555">5.6 GHz uses the verified 20 MHz C5 '
-                'CSI mode.</span>')
-            self.bw_buttons[self.bw].setChecked(True)
             return
         why = self.busy_reason()
         if why:
             self.rec_status.setText(f'<span style="color:#ff5555">{why}</span>')
             self.bw_buttons[self.bw].setChecked(True)
             return
-        ok = True
-        for m in self.macs:
-            try:
-                self.boards[m].write(f'BW {want}\n'.encode())
-            except (serial.SerialException, OSError):
-                ok = False
-        if not ok:
+        previous = self.bw
+        expected = f'BW_OK,{want},{self.channels[self.band]}'
+        with self.command_lock:
+            replies = self.send_bw(want)
+            confirmed = {m for m, reply in replies.items() if reply == expected}
+            if len(confirmed) != len(self.macs):
+                self.send_bw(previous)
+        if len(confirmed) != len(self.macs):
+            failed = ', '.join(LABEL.get(m[-5:], m[-5:])
+                               for m in self.macs if m not in confirmed)
+            self.rec_status.setText(
+                f'<span style="color:#ff5555">bandwidth switch failed on {failed}; '
+                f'rolled back to {previous} MHz</span>')
             self.bw_buttons[self.bw].setChecked(True)
-            return
+            return False
         self.bw = want
         self.bandwidths[self.band] = want
+        self.bw_buttons[want].setChecked(True)
         self.apply_rate_preset()
         # The subcarrier layout just changed: stale columns and a mean built on the
         # old width would both mislead, and the field split must be re-derived.
         self.recalibrate()
+        self.rec_status.setText(
+            f'bandwidth → {want} MHz · {self.frame_width()} subcarriers expected')
+        return True
+
+    def send_bw(self, want):
+        """Send one rig-wide bandwidth change and collect firmware acknowledgements."""
+        with self.bw_condition:
+            self.bw_replies = {}
+        for m in self.macs:
+            try:
+                self.boards[m].write(f'BW {want}\n'.encode())
+            except (serial.SerialException, OSError):
+                continue
+        deadline = time.monotonic() + 1.5
+        with self.bw_condition:
+            while len(self.bw_replies) < len(self.macs):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.bw_condition.wait(remaining)
+            return dict(self.bw_replies)
 
     def recalibrate(self):
         """Forget everything derived from past packets: waterfall columns, the running
@@ -1800,10 +1856,11 @@ class Live(QWidget):
     def issue(self, tx):
         """One board takes the token, everyone else listens for it."""
         try:
-            self.boards[tx].write(b'TX\n')
-            for m in self.macs:
-                if m != tx:
-                    self.boards[m].write(f'RX {tx.replace(":", "")}\n'.encode())
+            with self.command_lock:
+                self.boards[tx].write(b'TX\n')
+                for m in self.macs:
+                    if m != tx:
+                        self.boards[m].write(f'RX {tx.replace(":", "")}\n'.encode())
         except (serial.SerialException, OSError):
             return False
         return True
@@ -1818,8 +1875,9 @@ class Live(QWidget):
         board happened to be listening to before.
         """
         try:
-            for m in self.macs:
-                self.boards[m].write(b'RX 000000000000\n')
+            with self.command_lock:
+                for m in self.macs:
+                    self.boards[m].write(b'RX 000000000000\n')
         except (serial.SerialException, OSError):
             return False
         return True
@@ -2138,12 +2196,12 @@ class Live(QWidget):
                 if len(h) > 10]
         self.tiles['gap'].set(f'{max(gaps):.0f} ms' if gaps else '—')
 
-        # Each receiving board owns its own 92.16 KB/s wire; show the busiest.
+        # Each receiving board owns its own 8N1 UART; show the busiest one.
         frame_bytes = 26 + 2 * max(self.n_sub, 1)
         by_rx = {}
         for k, r in per.items():
             by_rx[k[1]] = by_rx.get(k[1], 0) + r
-        util = max((r * frame_bytes / 92160 for r in by_rx.values()), default=0)
+        util = max((r * frame_bytes / (BAUD / 10) for r in by_rx.values()), default=0)
         self.tiles['wire'].set(f'{100 * util:.0f}%',
                                None if util < 0.9 else WARN if util < 0.98 else BAD)
 
@@ -2258,7 +2316,7 @@ def main():
     n_links = len(boards) * (len(boards) - 1)
     print(f'{len(boards)} boards: {labels} -> {n_links} links', flush=True)
     if all(m in C5_MACS for m in boards):
-        expected = {'F', 'G'}
+        expected = {'F', 'G', 'H', 'I'}
     elif all(m not in C5_MACS for m in boards):
         expected = {'A', 'B', 'C', 'D'}
     else:

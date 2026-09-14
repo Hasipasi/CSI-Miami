@@ -775,3 +775,57 @@ leaving the peer at channel 120. The transition now supplies the required b/g/n
 bitmap. A five-step 2.4 → 5.6 → 2.4 → 5.6 → 2.4 hardware test returned `BAND_OK`
 from both boards at every step and delivered 484–622 frames per two-second sample,
 with 117 subcarriers on 2.4 GHz and 57 on 5.6 GHz and zero bad binary frames.
+
+## 2026-09-11 — 5.600 GHz HT40 verified on four C5 boards
+
+HT40 works on channel 120 when the transition is staged: enter 5 GHz at HT20 first,
+then set the bandwidth to 40 MHz, assign channel 116 as the secondary-below channel,
+and update the ESP-NOW peer rate. The earlier failure was the direct band+HT40 path,
+not a C5 hardware limitation.
+
+F/G/H/I all returned `BW_OK,40,120`. A fixed-transmitter smoke test at 300 ping/s
+rotated through all four transmitters for 1.5 seconds each. Eleven directed links
+delivered 449/449 frames and I→F delivered 446/449; every frame had 117 complex
+subcarriers and every parser reported zero bad frames. A staged
+5.6 HT40 → 2.4 HT40 → 5.6 HT40 cycle also returned the expected `BAND_OK` from all
+four boards. The GUI now waits for every bandwidth acknowledgement and rolls the
+whole rig back on a partial transition.
+
+## 2026-09-11 — C5 UART raised to 2 Mbaud
+
+All four WCH USB-UART bridges and C5 console UARTs run cleanly at 2,000,000 baud.
+Tested on 5.6 GHz HT40 with all 117 complex subcarriers, four-board round-robin,
+25 ms dwell, and eight seconds per point:
+
+| ping rate | busiest UART | minimum link delivery | parser errors | board drops |
+|---:|---:|---:|---:|---:|
+| 300 Hz | 31.1% | >100%* | 0 | 0 |
+| 600 Hz | 59.2% | 99.9% | 0 | 0 |
+| 900 Hz | 87.8% | 98.6% | 0 | 0 |
+
+*The short smoke-test window counted frames draining immediately after its nominal
+boundary; this is a harness-boundary artefact, not packet creation above the selected
+rate. The high-rate point is the useful result: all 12 links carried 1774–1807 clean
+frames against 1800 expected, with no `framedrops`, `textdrops`, or `sendfail` on any
+board. The round-robin wire ceiling is now about 1025 ping/s. Fixed-TX remains lower
+at about 769 because each receiver carries every ping continuously.
+
+## 2026-09-11 — 3 Mbaud and 300 Hz per round-robin link
+
+All four WCH bridges also pass at 3,000,000 baud. The viewer's rate buttons now mean
+per-link rate in both modes: in four-board round-robin, 100/200/300 sends firmware
+`RATE 400/800/1200`; in fixed-TX it sends `RATE 100/200/300` directly.
+
+Worst-case transport test: 5.6 GHz HT40, all 117 complex subcarriers, 25 ms dwell,
+eight seconds per point, all 12 directed links:
+
+| per-link target | firmware rate | busiest UART | link delivery range | bad frames | board drops |
+|---:|---:|---:|---:|---:|---:|
+| 100 Hz | 400 Hz | 26.2% | 100.0–101.1%* | 0 | 0 |
+| 200 Hz | 800 Hz | 52.6% | 98.6–101.8%* | 0 | 0 |
+| 300 Hz | 1200 Hz | 77.5% | 97.7–99.9% | 0 | 0 |
+
+*Small values above 100% are smoke-test boundary/timer quantisation, not excess
+packet generation. At the requested maximum, each link delivered 2344–2397 frames
+against 2400 expected. The 3 Mbaud HT40 round-robin wire ceiling is about 1538 ping/s
+or 384 Hz/link, leaving the 300 Hz setting roughly 22% transport headroom.
