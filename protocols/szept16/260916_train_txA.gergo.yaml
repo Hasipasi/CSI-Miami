@@ -1,0 +1,32 @@
+# Capture protocol — gergo, train split, SINGLE TRANSMITTER (A), 2026-09-16.
+#
+# Pin A in the viewer's TX bar before running (or start it with --tx A). Only
+# A->B, A->C and A->D exist in this configuration; the other 9 links do not exist,
+# so these takes are 3-link and NOT interchangeable with the 12-link round-robin
+# session recorded the same day. Each receiver hears every ping (~900 Hz per link
+# at the 300 preset; the GUI clamps a pinned rate to the receivers' wire).
+# Same takes, timing and rounds as 260916_train_RR.gergo.yaml; the session dir
+# is this file's stem, so the RR session is not touched.
+lead_in: 4
+duration: 7
+gap: 0
+
+repeats: 5
+
+takes:
+  - name: right_wave
+    instruction: WAVE WITH RIGHT HAND - Integess a jobb kezeddel
+
+  - name: left_wave
+    instruction: WAVE WITH LEFT HAND - Integess a bal kezeddel
+
+  - name: stretch_horizontal
+    instruction: STRETCH HORIZONTAL — Melkas nyújtás
+
+  - name: hand_on_neck
+    instruction: HAND ON NECK - Kezek a tarkóra
+
+  - name: arms_forward
+    instruction: ARMS FORWARD — Nyújtsd ki előre a kezeidet
+  - name: idle
+    instruction: MOVE TO THE NEXT MARK - Lépj a következő jelölőre

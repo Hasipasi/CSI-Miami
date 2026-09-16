@@ -829,3 +829,477 @@ eight seconds per point, all 12 directed links:
 packet generation. At the requested maximum, each link delivered 2344–2397 frames
 against 2400 expected. The 3 Mbaud HT40 round-robin wire ceiling is about 1538 ping/s
 or 384 Hz/link, leaving the 300 Hz setting roughly 22% transport headroom.
+
+## 2026-09-16 — round-robin turns are now counted, not timed (designed without boards)
+
+**No hardware was attached for any of this.** Everything below is reasoned from the
+code and the measurements above, compiled (esp32c5 and esp32s3), and exercised
+against simulated boards. The first session with the rig back must measure it before
+anything is recorded with it; the last section says what to look at.
+
+### The problem
+
+Every camera frame should carry CSI from every transmitter. It did not: the token
+moved on a host timer, 25 ms a board, so four boards took ~100 ms to go round
+against a 33.3 ms frame, and a given frame overlapped one or two transmitters. The
+"32% fresh" mask coverage in the datasets is this. A second, smaller defect in the
+same loop: each handoff wrote `TX` to the new holder *before* the `RX` lines to the
+receivers, and `become_tx` fires its first ping immediately, so the first ping of
+every dwell landed on receivers still filtering for the previous holder. One in six
+at 25 ms / 243 Hz; it would have been half of a two-ping turn.
+
+### What changed
+
+Firmware (`app_main.c`):
+
+* `TX <n> [tag]` — send exactly n pings at RATE, then stop, clear `is_tx`, and emit
+  `TX_DONE,<n>,<tag>` from the timer callback. The board returns to receiving by
+  itself; nothing has to be told to stop. Plain `TX` is unchanged (continuous:
+  fixed-TX mode and the old timed dwell). No LED change per burst.
+* `RX <mac>[,<mac>...]` — the filter is a list (up to 8). The host arms every board
+  once with every other board; the single-MAC form still works. `become_tx` no
+  longer clears the filter (the `is_tx` check already blocks self-loopback), so a
+  board hears the next transmitter the instant its own burst ends.
+* Command line buffer 64 → 160 B (an 8-MAC RX line is 107 characters).
+* Stopping a periodic esp_timer from inside its own callback is safe: checked in
+  IDF 5.5's `timer_process_alarm` — the timer is re-inserted *before* the callback
+  runs and the list lock is released around it, so the stop just removes the next
+  alarm. The direct first-ping call from the command task and the periodic timer
+  never run concurrently because the timer is started only after that call returns.
+
+Host (`TokenRing` in `capture.py`, used by both `capture.py` and `viewer.py`; the two
+copies of the rotation loop are gone):
+
+* A turn is one line to one board (`TX 2 <tag>`), then wait for that board's
+  `TX_DONE` — or `(n-1)/RATE + 50 ms`, whichever comes first. The tag is echoed so
+  a late TX_DONE can never release the *next* turn. Readers hand every text line to
+  `ring.on_line()`; that is the only new thing they do.
+* Receivers are re-armed once a second, right after their own burst (never
+  mid-burst), so a board that reboots mid-session and comes up with an empty filter
+  is deaf for at most a second. A board that misses three TX_DONEs in a row is
+  retried once a second instead of every cycle, so its timeout does not stretch
+  every cycle and cost the other links their coverage.
+* `--burst N` on both tools (default 2), live in the GUI as "pkts/turn". `--burst 0`
+  is the old timed dwell, kept so the two can be compared on the same rig.
+* Meta gains `burst`, `ping_rate_hz`, `ring_cycle_ms`, `ring_timeouts`.
+* New numbers: `frame_coverage()` — the share of camera frames with ≥ 1 packet on
+  *every* expected link inside the frame's window: half a frame period either side
+  of the frame timestamp (±16.7 ms at 30 fps), so consecutive frames' windows are
+  disjoint and a packet belongs to exactly one frame (`frame_half_window` derives
+  the half-width from the frame timestamps). It is the viewer's
+  "frames w/ all links" tile, the end-of-run line in `capture.py`, and the `cov%`
+  column in `check_session.py` (a burst-mode take under 90% is reported as a
+  problem). The viewer also shows the measured token cycle. In burst mode the
+  delivery tile compares received packets against pings actually commanded rather
+  than RATE × 1 s, and the loss tile counts only intra-burst steps.
+
+### Arithmetic
+
+Cycle ≈ boards × ((n−1)/RATE + h), h = one USB round trip (TX line out, TX_DONE
+back) plus two Python thread wake-ups. h is the number nobody has measured; the old
+one-way handoff cost ~0.65 ms of dead air (2026-08-24), the round trip is a guess at
+2–3 ms. Packets per link per frame ≈ n × 33.3 / cycle.
+
+| RATE | n | cycle (h = 2.5 ms) | visits per frame | pkts/link/frame |
+|---:|---:|---:|---:|---:|
+| 400 | 1 | 10 ms | 3.3 | 3.3 |
+| 400 | 2 | 20 ms | 1.7 | 3.3 |
+| 400 | 3 | 30 ms | 1.1 | 3.3 |
+| 1200 | 2 | 13 ms | 2.5 | 5 |
+| 1200 | 4 | 20 ms | 1.7 | 6.6 |
+| 1200 | 8 | 34 ms | ~1 | 7.8 — cycle longer than a frame |
+
+While h > 1/RATE the per-link rate is set by h, not by n: more pings a turn buys
+rate only at the cost of coverage. Hence n = 2 as the default at every rate the GUI
+offers; raise RATE before raising n. This trades the 300 Hz/link of 25 ms bursts for
+~100–200 Hz/link spread evenly — for the 30 fps datasets that is strictly better,
+since a burst of 30 packets inside one frame was one sample of the channel anyway.
+
+### Verified without hardware
+
+* `idf.py build` clean for esp32c5 (9% free) and, on a scratch copy with the target
+  switched, esp32s3 (24% free).
+* Simulated boards (0.8 ms one-way "USB", firmware semantics as above), four of
+  them, 1 s runs: 178 turns/s, cycle median 22.6 ms, 100% of synthetic 30 fps
+  frames saw all 12 links, no two boards pinging within 0.5 ms of each other, every
+  receiver armed before the first ping, tags unique. Dead board: suspended after 3
+  misses, retried 4× in 1.5 s, the other three boards' links covered ~95% of frames.
+  Rebooted-board re-arm at 1.0 s intervals, never mid-burst. One lost TX_DONE →
+  exactly one timeout, no suspension. Timed mode (`--burst 0`): RX-to-old-holder
+  always precedes TX-to-new, cycle ~107 ms at 25 ms dwell, one holder at a time.
+* Two things the simulation caught and the code now handles: the TX line of the
+  first turn could beat the receivers' RX lines (20 ms settle after arming), and the
+  turn in flight at shutdown counted as a timeout (it no longer does).
+
+### Measure first, when the boards are back
+
+1. Flash all four (the host will send `TX 2 <tag>` and the old firmware answers with
+   a warning and nothing else — every turn times out, the "token cycle" tile shows
+   `t/o` climbing, and `check_session` reports it).
+2. Start the viewer in round-robin at 100 Hz/link. Read **token cycle** (ms): that is
+   4 × (2.5 ms + h). Expect ~20 ms; 4 × h is the handoff tax to note here.
+3. **frames w/ all links** should sit at 100%. If it does not and the cycle is under
+   33 ms, look at delivery and drops, not at the schedule.
+4. Sweep pkts/turn 1 → 8 at 100 and 300 Hz/link and record cycle, coverage,
+   per-link rate. Then `--burst 0` for the old numbers on the same afternoon.
+5. Record one short take and run `check_session.py`; `cov%` is the same figure
+   offline. Delivery should still read 95–98%; if it reads high but the wire tile is
+   low, TX_DONE lines are being counted right and the boards are idle between bursts
+   as intended.
+
+Open questions: the real h (and whether it differs on the Linux rig PC and the Mac);
+whether TX_DONE lines ever get `text_drop`ped at high UART load (the 24 KB ring makes
+that unlikely below the knee, and a drop costs one 50 ms turn, not a stall); whether
+the S3 boards at 921600 baud, where a 354 B frame is 3.84 ms of UART, want n = 1.
+
+## 2026-09-16 (later) — the count-based ring measured on the boards, and tuned
+
+The boards arrived after the section above was written. `tools/ring_sweep.py` (new:
+arms the ring, runs it for a few seconds per point, no camera) on the four C5
+boards, 2.4 GHz HT40, 117 subcarriers, coverage against a synthetic 30 fps clock.
+
+**The timed dwell really did miss every frame**: 25 ms a board → 112.9 ms cycle,
+98.5% delivery, **0.0%** of frames with all 12 links, p99 gap 99 ms.
+
+**The round trip is far cheaper than guessed**: `TX` out, one ping, `TX_DONE` back,
+next `TX` out — 0.5 ms median on this Mac (turn p50 0.8 ms at one ping a turn; the
+whole four-board cycle 2–3.6 ms with no guard). The spec above guessed 2–3 ms.
+
+**But back-to-back transmitters lose packets.** With no guard: delivery 75–83%,
+and per link the loss was not uniform — transmitter B (`37:f4`, first in ring
+order) delivered ~100% of its bursts while the other three lost 15–30% of theirs
+entirely, plus ~20% of two-ping bursts arrived one ping short. The boards' own
+counters (`STATS`: framedrops, textdrops, sendfail) stayed at zero throughout, so
+it is loss on the air, not the wire or the radio queue. Cause: `TX_DONE` is
+emitted when the last ping is *queued*, the host answers within ~0.5 ms, and the
+next board's first ping collides with it; the strongest transmitter wins (capture
+effect), which is why one board looked immune. A host-side guard after each
+`TX_DONE` (`TokenRing.guard`, `--guard`) removed the whole-burst loss at 1 ms and
+kept improving delivery well past what airtime explains — so there is a receiver
+turnaround component too, not just the collision:
+
+| pings/turn | guard | cycle | cover | per link | delivery | turn p50/p99 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0 | 3.6 ms | 95.0% | 152 Hz | 74.9% | 0.5 / 7.4 ms (5 timeouts) |
+| 1 | 1 | 8.2 ms | 98.3–100% | 105 Hz | 90.3% | 0.8 / 3.0 |
+| 1 | 2 | 13.4 ms | 99.2% | 68 Hz | 93.4% | 0.8 / 3.1 |
+| 1 | 3 | 18.3 ms | 93.3% | 52 Hz | 95.0% | 0.8 / 2.6 |
+| 2 (400) | 0 | 13.7 ms | 74–90% | 112–124 Hz | 78–86% | 3.4 / 5.1 |
+| 2 (400) | 1 | 18.9 ms | 92–94% | 96 Hz | 93% | 3.4 / 5.1 |
+| 2 (400) | 2 | 24 ms | 86% | 78 Hz | 94% | 3.4 / 4.2 |
+| 2 (400) | 3 | 28.8 ms | 83% | 67 Hz | 96% | 3.4 / 4.5 |
+| 2 (400) | 5 | 39 ms | 58% | 50 Hz | 97.5% | 3.5 / 4.9 |
+| 2 (1200) | 2 | 17.8 ms | 95% | 101 Hz | 90% | 1.8 / 3.5 |
+| 3 (400) | 1 | 28.8 ms | 79% | 95 Hz | 91% | 5.9 / 6.4 |
+| 4 (1200) | 0 | 14.8 ms | 85% | 200 Hz | 76% | 3.4 / 9.0 |
+| 4 (1200) | 1 | 18.5 ms | 92% | 188 Hz | 90% | 3.3 / 6.6 |
+| 4 (1200) | 3 | 28.8 ms | 79% | 125 Hz | 90% | 3.4 / 5.1 |
+| 8 (1200) | 0 | 26.9 ms | 76% | 244 Hz | 85% | — |
+
+**Defaults now: one ping a turn, 1 ms guard** — every frame sees every link 3–4
+times, ~105 Hz per link, 90% delivery, 8 ms cycle. At one ping a turn RATE is
+irrelevant (the ring runs as fast as the round trip plus guard allows). Two pings a
+turn already misses ~5% of frames. `--guard 2` is the choice if 93% delivery
+matters more than 68 vs 105 Hz per link. Both are live in the GUI ("pkts/turn",
+"guard ms"); the "token cycle" and "frames w/ all links" tiles show the result.
+
+Not fixed in firmware on purpose: emitting `TX_DONE` from the ESP-NOW send
+callback (after the frame is on the air) would remove the collision but not the
+turnaround loss the guard sweep shows above 1 ms, so the host guard is needed
+either way and one knob is better than two. Open: which side the residual ~10%
+is on (the receiver that just transmitted, or the transmitter that was just
+receiving); the per-link pattern at 1 ms guard is nearly uniform, which argues
+against a pure "receiver deaf after its own TX" story.
+
+**`AGC LOCK` kills transmission on this firmware.** Sent to every board as an
+experiment: every `esp_now_send` afterwards failed (`sendfail` = every ping, on
+every board, until reset). The README already said the button was removed because
+it degrades recordings; the degradation is total. Left in the firmware, unused.
+
+### Boards relabelled: the four C5 boards are A–D now
+
+The ESP32-S3 boards are retired. Each C5 board was lit in its own colour and
+placed by eye, seen from the camera: **A** `38:24` near right beside the camera,
+**B** `38:14` near left, **C** `62:3c` far left, **D** `37:f4` far right (B and D
+were swapped later the same day at the user's request: the first assignment had
+them the other way round). `LABEL`
+in `capture.py` and `geometry.py`, the viewer's expected set and the README table
+are updated; sessions recorded before today carry F/G/H/I in their meta
+(F=`62:3c`, G=`37:f4`, H=`38:14`, I=`38:24`) and read fine.
+
+### RealSense depth, the flash drive, and the ground-truth toggle
+
+* `pyrealsense2-macosx` 2.56.5 installs into `.venv_mac` (cp313 arm64) and lists
+  the D435i, but streaming fails unprivileged with `failed to set power state` and
+  then **segfaults the interpreter at exit** — macOS lets only root seize a UVC
+  interface from the kernel driver. `open_camera('realsense')` therefore only tries
+  librealsense as root (`sudo .venv_mac/bin/python tools/viewer.py`) and otherwise
+  opens the RealSense colour stream through AVFoundation, colour only, and says
+  why. The `RealSenseCamera` class (colour + depth in one pipeline, hardware
+  timestamps mapped to wall time, real frame numbers) is written and compiles but
+  is **untested on a live stream** for lack of a root session here.
+* GUI: depth panel under the colour picture; `GT RGB | DEPTH` toggle (fixed for the
+  length of a take). Depth takes write 16-bit PNGs (`frames/000000.png`) through
+  the same writer, `meta['gt'] == 'depth'` plus `depth_scale_m` and intrinsics;
+  `write_capture` and `check_session` accept `.png` frames. The dataset builders
+  and `extract_poses` still assume colour JPEGs.
+* Captures default to the plugged-in flash drive on a Mac (`/Volumes/<stick>/data`,
+  today `/Volumes/GergoDisk/data`), `$CSI_DATA` overrides.
+
+### 2026-09-16 (later still) — a frame's CSI is a disjoint window centred on it
+
+Frame 45 of a 3 s test take (`/Volumes/GergoDisk/data/frametest`, one ping a turn,
+1 ms guard, RealSense colour through AVFoundation), packets per transmitter →
+receiver inside its ±16.7 ms window, drawn by the new `tools/plot_frame_packets.py`.
+Per board and window over the 91 frames: transmissions min 1–2, 10th percentile 2,
+median 3, max 4–5; every link present in ~96% of windows (the misses are single
+windows with one link absent, i.e. one lost turn landing on a window edge). At
+±30 ms the same take is 100%, but windows then overlap by 27 ms and a packet counts
+for two frames, which is why the disjoint definition was chosen. The token cycle
+while recording averages ~11 ms against the 8.5 ms median because the JPEG
+encoders and the camera grabber share the interpreter lock with the ring thread;
+moving the ring out of the recording process is the lever if a guaranteed ≥ 2 per
+board per frame is ever required.
+
+`--depth` is now an explicit flag on both tools: librealsense crashes the
+interpreter rather than failing when it cannot open the camera, and as root on
+macOS 26.5 it crashes during device enumeration (`query_devices`), so the default
+path never loads it. `tools/rs_probe.py` steps through it with the library's debug
+log for diagnosis. Homebrew has a native librealsense 2.58.4 bottle
+(`rs-enumerate-devices`) to test whether any build works on this macOS.
+
+### 2026-09-16 (evening) — 5.6 GHz / 40 MHz: no loss, and the schedule can be pushed
+
+The user's target configuration is 5.6 GHz, HT40, as many packets as possible with
+every link present in every frame window. `ring_sweep.py --band 5.6 --bw 40`
+(BAND then BW, both acknowledged by all four boards), 5 s per point, disjoint
+±16.7 ms windows on a synthetic 30 fps clock:
+
+| pings/turn | RATE | guard | cycle | windows with all links | pkts/link/window min / p10 / median | per link | delivery |
+|---:|---:|---:|---:|---:|---|---:|---:|
+| 1 | 2000 | 1.0 | 8.3 ms | 100% | 3 / 4 / 4 | 122 Hz | 100% |
+| 2 | 2000 | 1.0 | 10.8 ms | 100% | 4 / 6 / 6 | 187 Hz | 99.9% |
+| 3 | 2000 | 1.0 | 13.0 ms | 100% | 5 / 6 / 8 | 232 Hz | 100% |
+| 4 | 2000 | 1.0 | 14.5 ms | 100% | 8 / 8 / 8 | 274 Hz | 100% |
+| 6 | 2000 | 1.0 | 18.7 ms | 100% | 6 / 8 / 12 | 321 Hz | 100% |
+| 8 | 2000 | 1.0 | 23.4 ms | 100% | 6 / 8 / 11 | 341 Hz | 99.9% |
+| 10 | 2000 | 1.0 | 29.2 ms | 91% | 0 / 10 / 10 | 319 Hz | 9 timeouts, all board D |
+| 12 | 2000 | 1.0 | 33.9 ms | 88% | 0 / 8 / 12 | 319 Hz | 10 timeouts, all board D |
+| 4 | 2000 | 0.5 | 12.3 ms | 100% | 1 / 9 / 11 | 322 Hz | 99.9% |
+| 6 | 2000 | 0.5 | 17.6 ms | 100% | 8 / 10 / 12 | 341 Hz | 100% |
+| 8 | 2000 | 0.5 | 22.8 ms | 100% | 1 / 8 / 11 | 349 Hz | 99.8% |
+| 4 | 2000 | 0.3 | 12.0 ms | 100% | 8 / 9 / 12 | 334 Hz | 100% |
+| 6 | 2000 | 0.3 | 17.7 ms | 100% | 7 / 10 / 12 | 344 Hz | 100% |
+
+**Delivery is 99.8–100% everywhere.** The 10–20% loss measured at 2.4 GHz in the
+morning was the crowded band (channel 13 with the building's WiFi), not the ring:
+the guard that mattered so much there can drop to 0.3–0.5 ms here with no cost.
+The ceiling is the wire: at ~340 Hz per link each receiver's UART carries ~1000
+frames/s × 260 B ≈ 89% of 3 Mbaud, and from 10 pings a turn board D's `TX_DONE`
+lines start arriving late (its port lags; no drops are counted on the board), the
+50 ms timeouts stall the ring and coverage breaks.
+
+Then the same with the camera recording (capture.py, 5 s takes, JPEG encoders
+running — the load that stretched the cycle by ~30% in the morning), 5.6 GHz HT40,
+RATE 2000, guard 0.5, `check_session.py` on the takes:
+
+| pings/turn | cycle | windows with all links | pkts/link/window min / median | per link |
+|---:|---:|---:|---|---:|
+| **4** | 12.4 ms | **100%** | **5** / 10 | 313 Hz |
+| 6 | 17.6 ms | 99.3% | 0 / 12 | 332 Hz |
+| 8 | 24.5 ms | 92.7% | 0 / 11 | 327 Hz, 7 timeouts |
+
+**Defaults now, on both tools: 5.6 GHz, 40 MHz, RATE 2000, 4 pings a turn, 0.5 ms
+guard** (at 2.4 GHz: RATE 1200, 2 pings, 1 ms — the most that band can cover).
+Every frame window holds at least 5 and typically 10 packets per link at ~310 Hz
+per link with no radio loss. The GUI got a fourth rate button (500/link = RATE
+2000) that is the default at 5.6 GHz; `check_session.py` prints `win min/med`,
+the per-window minimum and median, beside `cov%`.
+
+Also today: a stray GUI launch (the camera watcher) in the middle of a sweep reset
+all four boards through discovery's DTR/RTS pulse and produced 8–18 timeouts per
+point — `ring_sweep.py` now counts boot banners per board and lists when each
+timeout happened, so that cannot masquerade as a schedule effect again. And after
+the root librealsense crash macOS listed only the RealSense's infrared/depth UVC
+interface (a grey IR picture when opened as a camera); replugging restored the RGB
+interface, and the colour fallback now refuses to open anything but the RGB one.
+
+### 2026-09-16 (night) — librealsense 2.58.4 built from source for the Mac
+
+`sudo rs-enumerate-devices` from Homebrew's librealsense 2.58.4 bottle lists the
+D435i with every stream profile on macOS 26.5, and `sudo rs-depth` streams — so the
+library itself is fine on this OS and the crash was the `pyrealsense2-macosx`
+2.56.5 wheel (built for macOS 15). The Homebrew formula has no Python bindings, so
+they were built from the v2.58.4 source (`cmake -DBUILD_PYTHON_BINDINGS=ON
+-DPYTHON_EXECUTABLE=.venv_mac/bin/python`, `make pyrealsense2`, ~8 min) and
+installed by hand into `.venv_mac/lib/python3.13/site-packages/pyrealsense2/`:
+the module `.so`, `librealsense2.2.58.dylib` beside it (`@loader_path` rpath,
+ad-hoc re-signed), libusb from Homebrew. The wheel is uninstalled. Still needs
+root to open the camera (`sudo .venv_mac/bin/python tools/viewer.py --depth`);
+the unprivileged GUI must not be running at the same time, since it holds the
+colour interface through AVFoundation.
+
+### 2026-09-16 (late) — depth on the Mac works: one root process serves both streams
+
+With the source-built pyrealsense2 the root probe streamed depth at 28 fps, but a
+viewer run under sudo did not work, and two facts fell out of the attempts:
+
+* librealsense's device open takes the **whole** camera from the OS stack, even
+  when only depth is asked for: the moment the root process had the depth
+  interface, AVFoundation stopped listing the RealSense's colour camera (it showed
+  only "... 435i Depth" until a replug). So on a Mac colour has to come through
+  librealsense too, once librealsense is involved at all.
+* `RS2_USB_STATUS_ACCESS` on interface 0 as root means the kernel UVC driver has
+  matched the *depth* interface — the state the camera re-enumerates into after a
+  failed grab; a replug puts the driver back on the colour interface and frees
+  depth. Anything that asks librealsense for the camera must therefore start from a
+  fresh plug.
+
+Result: `tools/depth_server.py`, run as root, opens colour + depth through
+librealsense (`RealSenseCamera`) and serves both over `/tmp/csi-depth.sock`
+(world-connectable): a JSON header, then per frame timestamp / length / sequence /
+kind and the raw bytes, newest frame only. `ServedCamera` in capture.py is the
+client, shaped like a camera (read() → (seq, wall time, BGR), .depth, wall_ts), and
+`open_camera`/`default_camera_device` prefer it whenever the socket exists — the
+first launch after the server came up had picked the FaceTime camera, because with
+the server holding the RealSense AVFoundation lists none, and the auto-choice had
+only looked there. Measured through the socket alongside the running viewer: 31 fps
+colour, 40 ms median latency, depth 97% valid at 3.8 m median in the lab. Colour
+frames now carry librealsense's global-time stamps (host clock) instead of arrival
+time, and the camera's own frame counter, so dropped frames are countable on the
+Mac after all.
+
+### 2026-09-16 (night) — the ring no longer waits for the host: pipelined turns
+
+Recording colour + depth (JPEG and PNG encoders, the socket copy from the depth
+server, four CSI readers) starved the ring thread often enough that 4–8 turns per
+5 s take got their TX_DONE too late, each one a 20–50 ms hole, and 1–4% of frame
+windows lost a link. Thread-switching tweaks moved that from 96% to 99% of windows;
+the structural fix is to take the host out of the per-turn path.
+
+Firmware: `TX <n> <tag> <delay_us>` queues a burst to start that many microseconds
+after the line arrived (FIFO of 8 per board, a 200 µs poll timer in the esp_timer
+task starts whatever is due; only that task moves the queue head — a first version
+that re-armed a one-shot timer from the command task fired bursts twice and late).
+`PEERS a,b,c` sets the filter list without cancelling queued bursts; `RX` still
+cancels everything. Host: `TokenRing` in pipelined mode issues whole cycles five
+cycles ahead (`TX 4 <tag> <delay>` to each board with its own delay), keeps the
+schedule on the host clock, and only reads the TX_DONE lines for the books; the
+gated mode (turn issued on the previous TX_DONE) is kept as `--schedule gated`.
+
+The trap: a self-timed schedule can outrun the serial wire, and the gated mode had
+been hiding that — waiting for every TX_DONE throttled the ring to whatever the
+wire drained (12.2 ms cycles at 4 pings), while the pipelined 9.6 ms cycle put
+1250 frames/s × 260 B = 108% of 3 Mbaud on each receiver's UART: the boards' 24 KB
+TX rings filled within a second, every TX_DONE queued ~75 ms behind the frames and
+half were dropped (lateness grew ~1 ms per cycle and saturated at 74 ms — the
+ring's drain time). `turn_time()` now floors the turn at what the wire carries:
+(boards−1) × pings × frame bytes per cycle at 85% of the byte rate, frame width
+learned from the stream. With that, pipelined = 12.2 ms cycles, and:
+
+| | windows with all 12 links | pkts/link/window min / median | per link | bursts late by |
+|---|---:|---|---:|---:|
+| sweep, no camera | 100% | 7 / 12 | 327 Hz | p50 2.8 ms, max 3.8 ms |
+| recording colour + depth, 6 s takes | 100% / 99.4% (then 100% / 100%, see below) | 4 / 11 | ~320 Hz | p50 2.9 ms, p99 5.2 ms |
+
+Late TX_DONEs under recording load are now the host's readers being slow, not the
+boards, so they are only counted (with the lookahead as slack) and never change
+the schedule; a dead board's slot simply stays empty. Lookahead was raised from
+three to five cycles after one 6 s take showed a host stall longer than 36 ms.
+
+### 2026-09-16 (late night) — every take carries its per-frame CSI windows, padded
+
+The user's model input is one window of CSI per camera frame, all links, fixed
+shape, missing packets as zeros. `write_capture` now cuts that from the packet
+arrays it has just built (`window_tensor` in capture.py): `win_iq` int8
+[frames, 4, 4, 16, subcarriers, 2] wire I/Q with `win_gain`, and per slot
+`win_t` / `win_ts` / `win_lts` / `win_rssi` / `win_agc` / `win_fft` / `win_idx`
+(index into the link's arrays, -1 = pad), `win_count` per link. Diagonal zero,
+padding zero, 16 slots (a 33 ms window holds 10-13 at the tuned schedule;
+overflow is counted in meta). Costs 0.04 s to build and ~4 MB compressed per 6 s
+take (181 frames); the raw packet arrays stay beside it. On the 6 s test takes:
+2-12 packets per link-window, median 11.
+
+### 2026-09-16 (after the first session) — checks on the train set, and what changed
+
+`260916_train_RR.gergo`: 30 takes, all 12 links in every take, ~26,600 packets a
+take (~320 Hz per link), 99.6% of frame windows complete, median 11 packets per
+link per window. Two patterns in the rest: (1) in 24 takes the one incomplete
+window was **frame 0** — the take's first colour frame is stamped 8–36 ms before
+its first packet (the recording start briefly stalls the packet readers while
+the frame arrives with the camera's earlier exposure time); (2) three takes lost
+3–19 colour frames and most had ~4% fewer depth than colour frames, the recording
+process being busy (JPEG + PNG encoding, the socket copies, the GUI).
+
+Changes: the first frame of a take is now held until every link has packets half
+a period behind it, so frame 0 always has a full window; depth frames are recorded
+straight from the camera thread instead of sampled at colour-frame time; the GUI
+redraws at half rate while a take records. And a take keeps only its complete
+frames — image present, depth frame within half a period (colour+depth mode), no
+link missing from the CSI window — with the counts in `meta['frames_dropped']`;
+`tools/prune_frames.py` applies the same rule to takes already on disk (the train
+set was pruned with it: see the numbers in the session log below).
+
+**Depth is the ground truth, so depth frames are now THE frames** (`--frames
+depth`, default): 16-bit PNGs under `frames/`, the CSI windows anchored on their
+timestamps, no colour at all (the JPEG encoders were most of the recording load).
+`--frames both` and `--frames colour` remain, switchable between takes in the GUI.
+Verified on a 7 s take: 210 depth frames, 100% of windows complete, min 3 /
+median 11 packets per link per window, ~70 MB per take (depth PNGs at zlib level
+1 are ~300 KB each; raise the level if the stick fills).
+
+`win_a` (float16 amplitude, [frame, tx, rx, slot, subcarrier], same units as
+`tx|rx|a`) added beside `win_iq` so a model that eats raw amplitude indexes it
+directly; `prune_frames.py` back-fills it into takes written before. The test
+session (`260916_test_RR.gergo`, 18 takes, recorded in colour+depth mode before
+depth-only became the default) is clean: every window complete, 3597 of 3708
+frames kept — the 111 dropped are colour frames whose depth frame was missed by
+the client under load, 28 / 29 / 21 of them in three takes. The train session
+after pruning: 5947 of 6237 frames kept (290 dropped: 270 with no depth frame
+within half a period, 20 with a link missing from the window, 0 without an image).
+
+The model input layout the user asked for, saved in every take beside the tx × rx
+windows: `csi [frame, receiver, subcarrier, T]` float16 amplitude — per receiver
+every packet of the window from every transmitter, in time order along T
+(T = (boards − 1) × 16 slots = 48 in round-robin, 16 with a pinned transmitter),
+`csi_t` / `csi_tx` / `csi_count` beside it (`receiver_tensor` in capture.py).
+At the tuned schedule a receiver has 19–35 packets per window (median 32), so
+about a third of T is padding. `prune_frames.py` back-fills it; both 2026-09-16
+sessions were rewritten with it.
+
+Default frames are **colour + depth** (`--frames both`, the RGB+DEPTH button):
+3-D pose needs the colour image for the 2-D keypoints and the depth for their
+z. Set after the txA sessions came out depth-only under the short-lived
+depth-only default; those two sessions (30 + 18 takes) remain depth-only.
+
+### 2026-09-16 (evening, second session) — pinned A, the GUI starving its readers, and board-clock packet times
+
+Pinned-A sessions (train 30, test 18 takes, depth-only by the then default) went
+in at RATE 980 (the 500 preset clamped to 85% of the receivers' wire; 1500 would
+be 130% of it). The viewer showed the per-link rate swinging 670–960 Hz and
+delivery 68–98% while idle; headless the same setup delivered 980/980/980 every
+second for 12 s with zero board drops, zero send failures, zero reboots — the
+boards were fine, the GUI process was starving its serial readers (30 Hz redraw
++ per-packet numpy in the readers). Lowering the redraw to 15 Hz (7.5 while
+recording) and sampling the EMA every 8th packet made it steady at 100% with
+occasional dips that are followed by >100% seconds: packets delayed in the OS
+buffer and stamped late, not lost (host parser errors now show live; they were 0).
+The recordings themselves were never short (20,550 packets per 6.9 s take = the
+full 980 Hz × 3 links).
+
+Late stamping does move packets into the next frame's window, though (txA takes
+had windows of 24–41 packets and overflows of the 48 slots). Packet times are now
+`tx|rx|tc`: the receiving board's own microsecond clock mapped onto host time by
+that receiver's least arrival delay (1st percentile of arrival − board time); a
+host stall can only add delay, so it cannot move a packet. Windows and the
+nearest-frame assignment use `tc`; `t` (arrival) stays. On arms_forward4 (pinned)
+the windows went from 24–41 packets per receiver to 32–33 exactly. `prune_frames.py
+--rewindow` rebuilds the windows of takes on disk from the raw packets; all four
+sessions were rewound with it.
+
+Also this session: the viewer writes takes in a background thread after the
+protocol ends (writing between takes froze the GUI for seconds); a take whose
+write fails is kept as `<take>_raw.pkl` and `rewrite_raw.py` writes it later
+(this saved two takes that hit an AppleDouble `._` file in their frame folder);
+pinned mode gets 48 window slots and its own pruning rule (only the pinned
+transmitter's links must be present); meta is JSON-safe against NumPy scalars.

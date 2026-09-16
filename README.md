@@ -1,8 +1,9 @@
 # csi-rig
 
-A four-node WiFi-CSI sensing rig: four ESP32-S3 boards pass a transmit token
-around a room while a depth camera watches, producing time-aligned **channel state
-information + video** for human activity recognition and pose estimation.
+A four-node WiFi-CSI sensing rig: four ESP32-C5 boards pass a transmit token
+around a room while a RealSense watches, producing time-aligned **channel state
+information + video (colour or depth)** for human activity recognition and pose
+estimation.
 
 Everything runs in one Docker container. The host needs Docker, an X server for the
 GUI, and a separate Python venv only for the pose model (which wants CUDA).
@@ -11,23 +12,25 @@ GUI, and a separate Python venv only for the pose model (which wants CUDA).
 
 ## The hardware
 
-The original rig uses **four ESP32-S3 (N16R8) boards**. The firmware and tools now
-also support the dual-band **ESP32-C5-DevKitC-1** boards. Boards are identified by
-MAC, never by `/dev/ttyACM*` or `/dev/cu.*` — paths change on every replug and the
-tooling auto-discovers.
+The rig is **four dual-band ESP32-C5-DevKitC-1 boards** (since 2026-09-16; the
+original four ESP32-S3 N16R8 boards A–D are retired, and the S3 code paths remain
+only so old recordings and the `esp32s3` build keep working). Boards are identified
+by MAC, never by `/dev/ttyACM*` or `/dev/cu.*` — paths change on every replug and
+the tooling auto-discovers.
 
-| label | MAC | USB serial |
-|---|---|---|
-| A | `14:c1:9f:c1:2d:3c` | 5C37261255 |
-| B | `dc:da:0c:77:6b:5c` | 5C37262351 |
-| C | `30:30:f9:1d:ab:d4` | 5C39018763 |
-| D | `14:c1:9f:c1:2d:a8` | 5C39020696 |
-| F | `10:bd:a3:e6:62:3c` | 5C94096576 |
-| G | `10:bd:a3:e6:37:f4` | 5C94096770 |
-| H | `10:bd:a3:e6:38:14` | 5C94096765 |
-| I | `10:bd:a3:e6:38:24` | 5C94096766 |
+| label | position (seen from the camera) | MAC | USB serial |
+|---|---|---|---|
+| A | near row, right, beside the camera | `10:bd:a3:e6:38:24` | 5C94096766 |
+| B | near row, left | `10:bd:a3:e6:38:14` | 5C94096765 |
+| C | far row, left | `10:bd:a3:e6:62:3c` | 5C94096576 |
+| D | far row, right | `10:bd:a3:e6:37:f4` | 5C94096770 |
 
-F/G/H/I are ESP32-C5 boards. An all-C5 rig can switch live between 2.4 GHz channel 13
+Retired S3 boards, for reading old `meta['boards']`: A `14:c1:9f:c1:2d:3c`,
+B `dc:da:0c:77:6b:5c`, C `30:30:f9:1d:ab:d4`, D `14:c1:9f:c1:2d:a8`, E (the returned
+fifth board) `ec:da:3b:4c:b8:d0`. The C5 boards carried the interim labels F/G/H/I
+(F=`62:3c`, G=`37:f4`, H=`38:14`, I=`38:24`) in sessions before 2026-09-16.
+
+An all-C5 rig can switch live between 2.4 GHz channel 13
 and 5.600 GHz channel 120 from the GUI. Both HT20 (57 complex subcarriers) and HT40
 (117) are verified on C5 at 5.6 GHz. The firmware enters 5 GHz through HT20 before
 widening because a direct band+HT40 transition leaves the ESP-NOW peer behind. S3 and
@@ -38,12 +41,36 @@ is a known C5 because an S3 cannot follow the band change.
 update `LABEL` in `tools/capture.py` and the coordinates in `NOTES.md`. Getting this
 wrong silently mislabels every downstream figure; it has already happened once.
 
-**Layout** (setup 3): a 3 m square, `D C` on the far row, `A B` on the near row,
-diagonals 4.24 m. Measured link quality does *not* follow this geometry — see
+**Layout** (setup 3): a 3 m square. Seen from the camera, `C D` on the far row and
+`B A` on the near row (A beside the camera), diagonals 4.24 m. Measured link quality does *not* follow this geometry — see
 `NOTES.md`.
 
-**Intel RealSense D435i** on USB 3.0 for ground truth: 1280×720 colour at 30 fps.
-Depth and IR work but are not currently recorded.
+**Intel RealSense D435i** on USB 3.0 for ground truth: 1280×720 colour at 30 fps,
+and 640×480 depth (uint16, 1 mm units) alongside it. The GUI shows depth under the
+colour picture and a `GT` toggle picks which stream a take records: colour as JPEGs
+or depth as lossless 16-bit PNGs (`frames/000000.png`, `meta['gt'] == 'depth'`,
+with `depth_scale_m` and the intrinsics in meta). Depth comes through librealsense
+(`pyrealsense2`), which also gives the colour frames their hardware timestamp and
+frame counter.
+
+**On a Mac, run `tools/depth_server.py` as root and everything else normally.**
+librealsense can only open the camera as root there, and once it has the camera
+the OS camera stack loses it (the colour interface vanishes from AVFoundation
+until a replug), so the one root process serves both colour and depth over a local
+socket (`/tmp/csi-depth.sock`) and the viewer and recorder, unprivileged, take
+both from it automatically. Plug the camera in fresh, then in its own terminal:
+
+```bash
+sudo .venv_mac/bin/python tools/depth_server.py      # leave it running
+.venv_mac/bin/python tools/viewer.py                 # in another terminal, as usual
+```
+
+Without the server the tools use the RealSense colour stream through AVFoundation,
+colour only, and the depth panel says so. The `pyrealsense2` in `.venv_mac` is
+librealsense 2.58.4 built from source on 2026-09-16 (the `pyrealsense2-macosx`
+wheel crashes on macOS 26); `tools/rs_probe.py` is the step-by-step diagnostic. On
+the Linux rig the normal udev rules suffice and the tools open the camera through
+librealsense directly with `--depth`.
 
 ### How a capture works
 
@@ -51,6 +78,30 @@ One board holds a "transmit token" and pings at `CONFIG_SEND_FREQUENCY`; every o
 board receives and reports CSI for that packet. The PC rotates the token over UART —
 **round-robin**, giving all 12 ordered board pairs ("links") — or pins one board as
 the sole transmitter, giving 3 links at ~4× the per-link rate.
+
+Round-robin turns are **count-based and scheduled ahead** (`--burst N`, live in
+the GUI as "pkts/turn"): the host tells every board its next turns several cycles
+in advance (`TX <n> <tag> <delay_us>`), each board starts its bursts on its own
+timer and answers `TX_DONE`, and the host only keeps the schedule topped up and
+reads the replies for the books — so a busy recording process cannot leave holes
+in the ring. Receivers are armed once with the list of every other board (`RX
+a,b,c`, refreshed with `PEERS`). The turn spacing is floored by what the serial
+wire drains (`--schedule gated` is the older one-turn-per-round-trip mode). The point is that the token goes
+round all four boards in well under one 33 ms camera frame, so **every video frame
+carries CSI from every transmitter**. Measured on 2026-09-16 with the four C5
+boards while recording video, at the default **5.6 GHz / 40 MHz / RATE 2000 / 4
+pings a turn / 0.5 ms guard**: the token goes round in **12 ms**, every 30 fps
+frame window holds at least 5 and typically 10 packets on every one of the 12
+links, ~310 Hz per link, no radio loss. The previous timed dwell (25 ms a board,
+still available as `--burst 0`) took 113 ms to go round and **0%** of frames saw
+every link. At 2.4 GHz the band itself loses 10–20% of packets and back-to-back
+transmitters collide, so the defaults there are 2 pings a turn with a 1 ms guard
+(~95 Hz per link, every frame covered). `tools/ring_sweep.py` measures all of
+this without a camera; the viewer's "frames w/ all links" and "token cycle" tiles
+and `check_session.py`'s `cov%` column report it on real takes, and
+`tools/plot_frame_packets.py` draws one frame's packets per link. A frame's CSI is
+the window half a frame period either side of its timestamp (±16.7 ms at 30 fps):
+centred on the picture, and disjoint from the neighbouring frames' windows.
 
 Each link is a distinct path across the room. There is no antenna array here: `L=12`
 means twelve room-spanning paths, not twelve antennas.
@@ -95,11 +146,29 @@ number that matters for aligning CSI to 30 fps video is the gap, not the rate:
 | 30 SC, 675 Hz, 12.5 ms dwell | 118.4 Hz | 1.39 ms | 71.4 ms |
 | **166 SC, 243 Hz, 25 ms dwell** (shipped) | **43.5 Hz** | 4.19 ms | **99.9 ms** |
 
-Raising the ping rate makes bursts denser and leaves the gap untouched — only
-`--round-duration` closes it. Its optimum depends on frame size, so it is not a
-constant: 12.5 ms with 30 subcarriers, 25 ms with 166 (where 354 B is 3.84 ms of UART
-and a shorter dwell fits too few frames to be worth the handoff). Change the
-subcarrier count and this needs re-measuring.
+Those rows are the timed dwell (`--burst 0`). Raising the ping rate makes bursts
+denser and leaves the gap untouched — only a shorter turn closes it. Count-based
+turns (`--burst N`) replace that: the gap becomes the token cycle,
+`boards × ((N-1)/RATE + guard + round trip)`, and the USB round trip for the `TX`
+line out and the `TX_DONE` line back measures only ~0.5 ms on this Mac. Measured
+2026-09-16, four C5 boards, 2.4 GHz, against a 30 fps clock:
+
+| pings/turn | guard | cycle | frames with all 12 links | per link | delivery |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0 ms | 3.6 ms | 95% | 152 Hz | 75% |
+| **1** | **1 ms** | **8 ms** | **98–100%** | **105 Hz** | **90%** |
+| 1 | 2 ms | 13 ms | 99% | 68 Hz | 93% |
+| 2 | 1 ms | 19 ms | 94% | 96 Hz | 93% |
+| 4 (RATE 1200) | 1 ms | 18 ms | 92% | 188 Hz | 90% |
+| timed 25 ms dwell | — | 113 ms | 0% | 98 Hz | 98.5% |
+
+That table is 2.4 GHz, where the band loses packets. At 5.6 GHz / 40 MHz delivery
+is 100% at every setting and the wire is the limit (~340 Hz per link fills the
+receivers' UARTs to ~89%): while recording, 4 pings a turn at RATE 2000 covers
+every frame with 5–10 packets per link, 6 gets a little more but drops a link
+from the odd frame, 8 overruns the wire. More pings a turn buy per-link rate at
+the cost of coverage; the guard buys delivery (at 2.4 GHz) at the cost of cycle.
+The number to watch is "frames w/ all links", not the per-link rate.
 
 **Raw phase is unusable as it arrives, and usable after detrending.** Measured on a
 static scene: raw phase has sd 1.84 rad across packets, against 1.814 for uniform
@@ -147,9 +216,17 @@ docker compose run --rm csi bash -lc "cd /workspace/tools && python3 camera_prob
 docker compose run --rm -e QT_X11_NO_MITSHM=1 --name csi_live csi \
   bash -lc "cd /workspace/tools && exec python3 viewer.py --protocol /workspace/protocols/gergo_train.yaml"
 
-# macOS native GUI (uses the checked-out .venv_mac)
+# macOS native GUI (uses the checked-out .venv_mac); for depth, first start
+# `sudo .venv_mac/bin/python tools/depth_server.py` in another terminal
 .venv_mac/bin/python tools/viewer.py
+
+# measure the round-robin schedule on the boards, no camera needed
+.venv_mac/bin/python tools/ring_sweep.py --points 1:400,2:400,0:400 --guard 1
 ```
+
+Captures go to `$CSI_DATA` if set, else `<flash drive>/data` on a Mac with a stick
+plugged in (the viewer prints where at startup), else `/workspace/data` in the
+container, else `<repo>/data`.
 
 Only one process can own the serial ports at a time — stop the viewer before running
 anything else that talks to the boards.
@@ -175,6 +252,38 @@ firmware ──UART──▶ tools/capture.py ──▶ data/<session>/*.npz
 `tools/viewer.py` is the normal way in: live camera beside per-link CSI waterfalls,
 a REC button, and scripted protocols with a big cue card for whoever is standing in
 the array. `tools/capture.py` does the same headless.
+
+Every take is one NPZ holding the CSI packets per directed link (`tx|rx|t`,
+`tx|rx|iq`, `tx|rx|a`, gain and RSSI per packet), the frames, and **the per-frame
+CSI windows**. What the frames are is chosen per session (`--frames`, the "frames"
+buttons in the GUI): **by default colour JPEGs with the depth frames beside them**
+(`frames/000000.jpg`, `depth/000000.png`, `depth_t`, `frame_depth_idx` pairing
+each colour frame with its depth frame — 3-D pose needs both), or colour alone, or
+the depth frames alone (16-bit PNGs under `frames/`, `meta['gt'] == 'depth'`).
+Only complete frames are kept: a frame with no image (encoder queue full), no depth
+frame within half a period (in colour+depth mode) or a link missing from its CSI
+window is dropped at write time and counted in `meta['frames_dropped']`;
+`tools/prune_frames.py` applies the same rule to takes already on disk. The
+windows: for each frame, the packets within half a frame period of it as a fixed-shape
+transmitter × receiver grid of up to 16 packet slots per link, zero-padded. **The
+model input is `csi [frame, receiver, subcarrier, T]`**, float16 amplitude: for each
+of the 4 receivers, every packet it heard in the window from every transmitter,
+flattened in time order along T (T = 3 × 16 = 48 in round-robin; with a pinned
+transmitter the 3 receivers × T = 16), with `csi_t` (seconds from the frame),
+`csi_tx` (transmitter index into `win_boards`, −1 = padding) and `csi_count` (real
+packets per receiver) beside it. The same amplitude is also kept per link as
+`win_a [frame, tx, rx, slot, subcarrier]` (uncalibrated |I+jQ|×gain, the units of
+`tx|rx|a`) and
+`win_iq [frame, tx, rx, slot, subcarrier, (re, im)]` as the int8 wire values with
+`win_gain` to scale them, and beside every slot its time from the frame (`win_t`),
+absolute time (`win_ts`), the receiving board's clock (`win_lts`), `win_rssi`,
+`win_agc`, `win_fft`, and `win_idx`, the packet's index into the link arrays.
+`win_count` says how many slots are real; zeros are padding, and the diagonal is
+always zero because a board never hears itself. Packet times for the windows and
+the nearest-frame assignment are `tx|rx|tc`, the receiving board's own clock
+mapped onto host time (a busy host stamps packets late; the board never does);
+`tx|rx|t` remains the host arrival time. `check_session.py` reports the
+per-window minimum and median and flags any empty link-window.
 
 A protocol YAML defines the takes:
 
@@ -242,8 +351,10 @@ Each dataset gets a `manifest.json` (read it first), `clips.csv`, `stats.npz`,
 
 **CSI is irregularly sampled.** The grid in a dataset is a resampling choice, and
 `mask` says which cells are a fresh packet versus the nearest one held. Round-robin
-at 30 Hz is ~32% fresh; ignoring the mask means treating stale values as
-observations. The raw irregular packets ship in the activity clips so a different
+at 30 Hz was ~32% fresh under the timed dwell; ignoring the mask means treating stale
+values as observations. Count-based turns exist to push that towards 100% — check the
+`cov%` column of `check_session.py` on a new session rather than assuming either
+figure. The raw irregular packets ship in the activity clips so a different
 grid can be built without re-recording.
 
 **192 subcarriers carry ~2.6 effective dimensions.** Measured by PCA
@@ -327,12 +438,15 @@ change; the table in `NOTES.md` records what each combination gave.
 `dependencies.lock` is tracked and `managed_components/` is not — `idf.py build`
 restores the components from the lock, which also pins their content hashes.
 
-Boards accept `TX`, `RX <mac>`, `RATE <hz>`, `SUB <n>`, `BAND <2.4|5.6>`, `CHAN <n>`,
-`BW <20|40>`, `SCAN [ms]`, `IDENT`, `IDENT OFF`, `LED r,g,b` on the serial line and
-reply with `ROLE_TX` / `ROLE_RX,<mac>` / `RATE_OK,<hz>` / `BAND_OK,<band>,<ch>,<bw>` /
-`CHAN_OK,<ch>,<bw>` / `BW_OK,<bw>,<ch>` / `SCAN_CH,...` lines. `BAND`, `CHAN`, and
-`BW` must be issued to every board together. CSI arrives as binary frames interleaved
-with those text lines on the same UART:
+Boards accept `TX`, `TX <n> [tag]`, `RX <mac>[,<mac>...]`, `RATE <hz>`, `SUB <n>`,
+`BAND <2.4|5.6>`, `CHAN <n>`, `BW <20|40>`, `SCAN [ms]`, `IDENT`, `IDENT OFF`,
+`LED r,g,b` on the serial line and reply with `ROLE_TX` / `TX_DONE,<n>,<tag>` /
+`ROLE_RX,<count>,<macs>` / `RATE_OK,<hz>` / `BAND_OK,<band>,<ch>,<bw>` /
+`CHAN_OK,<ch>,<bw>` / `BW_OK,<bw>,<ch>` / `SCAN_CH,...` lines. `TX <n>` sends `n`
+pings and then returns to receiving by itself, announcing `TX_DONE`; plain `TX` pings
+until an `RX` line arrives. `RX` takes up to 8 MACs and accepts CSI from any of
+them. `BAND`, `CHAN`, and `BW` must be issued to every board together. CSI arrives
+as binary frames interleaved with those text lines on the same UART:
 
 ```
         v1 (amplitude)              v2 (I/Q)

@@ -36,15 +36,13 @@ BOOT_MAC_RE = re.compile(r'Board MAC ([0-9a-fA-F:]{17})')
 # Physical placement, established by lighting each board and asking. Update this
 # whenever the boards are rearranged, and update COORDS in the plotting tools to
 # match -- the letters are shared between them.
+# Seen from the camera: near row B A (A beside the camera), far row C D. The four
+# ESP32-C5 boards, assigned 2026-09-16; the retired S3 boards are gone from here.
 LABEL = {
-    '14:c1:9f:c1:2d:3c': 'A',
-    'dc:da:0c:77:6b:5c': 'B',
-    '30:30:f9:1d:ab:d4': 'C',
-    '14:c1:9f:c1:2d:a8': 'D',
-    '10:bd:a3:e6:62:3c': 'F',
-    '10:bd:a3:e6:37:f4': 'G',
-    '10:bd:a3:e6:38:14': 'H',
-    '10:bd:a3:e6:38:24': 'I',
+    '10:bd:a3:e6:38:24': 'A',
+    '10:bd:a3:e6:38:14': 'B',
+    '10:bd:a3:e6:62:3c': 'C',
+    '10:bd:a3:e6:37:f4': 'D',
 }
 
 

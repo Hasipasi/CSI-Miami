@@ -65,10 +65,10 @@ from PyQt5 import QtCore
 import pyqtgraph as pg
 
 from capture import (BAUD, C5_MACS, SUB_INDEX, CsiStream, JpegWriter, LABEL,
-                     default_camera_device, default_outdir, derive_fields,
-                     discover, field_bounds, open_camera, owner_of,
-                     parse_scan_line, rank_channels, resolve_prefix,
-                     write_capture)
+                     TokenRing, camera_gt_meta, default_camera_device,
+                     default_outdir, derive_fields, discover, field_bounds,
+                     frame_coverage, frame_half_window, frame_wall, open_camera, owner_of,
+                     parse_scan_line, rank_channels, resolve_prefix, write_capture)
 
 pg.setConfigOptions(imageAxisOrder='row-major')
 
@@ -340,13 +340,35 @@ class Cue(QWidget):
 
 
 class Live(QWidget):
+    # From the background writer thread to the GUI thread: progress text, and done.
+    writer_status = QtCore.pyqtSignal(str)
+    writer_done = QtCore.pyqtSignal()
+
     def __init__(self, boards, cam, args):
         super().__init__()
         self.boards, self.cam, self.args = boards, cam, args
+        # Takes captured but not yet written. Writing a take -- the windows, ~30 MB
+        # of compressed arrays, 60 MB of frames zipped and CRC-checked on a USB
+        # stick -- takes seconds, and doing it in the GUI thread between the takes
+        # of a protocol froze everything; it now happens in one background thread
+        # after the protocol has finished (a manual take: right away, in the
+        # background).
+        self.pending = []
+        self.writer = None
+        self.writer_status.connect(lambda t: self.rec_status.setText(t))
+        self.writer_done.connect(self.on_writer_done)
         self.macs = sorted(boards)
         self.c5_rig = all(m in C5_MACS for m in self.macs)
         self.stop = threading.Event()
         self.command_lock = threading.Lock()
+        # Who transmits next in round-robin and when: count-based bursts gated on
+        # the boards' TX_DONE lines (see TokenRing). Shares the command lock with
+        # the pinned/parked role commands so lines never interleave on a port.
+        self.ring = TokenRing(boards, self.macs, self.stop, burst=args.burst,
+                              dwell=args.round_duration, lock=self.command_lock)
+        self.ring.guard = args.guard / 1000.0
+        self.ring.pipelined = args.schedule == 'pipelined'
+        self.ring_timeouts_seen = 0
         self.band_condition = threading.Condition()
         self.band_replies = {}
         self.bw_condition = threading.Condition()
@@ -358,6 +380,14 @@ class Live(QWidget):
         self.lock = threading.Lock()
         self.frame = None
         self.frame_times = deque(maxlen=60)
+        # The colourised depth frame that came with self.frame, when the camera is a
+        # RealSense through librealsense; None otherwise. Display only unless the
+        # GT toggle says depth is what gets recorded.
+        self.depth_view = None
+        self.has_depth = bool(getattr(cam, 'has_depth', False))
+        # What a take's frames are: 'both' (colour JPEGs with depth PNGs beside
+        # them -- the default, 3-D pose needs both), 'colour' or 'depth' alone.
+        self.frame_kind = args.frames if self.has_depth else 'colour'
         # Last time each board delivered a CSI line. A dropped USB port does not
         # raise: readline() just returns empty forever, so the reader thread spins
         # and the board goes silent with nothing anywhere reporting it. That cost a
@@ -472,10 +502,14 @@ class Live(QWidget):
         left = QVBoxLayout()
         # Live health belongs with the camera overview rather than the radio controls.
         self.tiles = {}
+        # 'cover' is the one the round-robin schedule is tuned for: of the last
+        # second's camera frames, the share that carried a packet on EVERY link.
+        # 'ring' is how long the token takes to go round; it has to beat a frame.
         tile_rows = (
             (('rate', 'per-link rate'), ('gap', 'gap p99'),
-             ('drops', 'drops (board·host)')),
-            (('deliv', 'delivery'), ('loss', 'radio loss'), ('wire', 'wire util')),
+             ('cover', 'frames w/ all links'), ('drops', 'drops (board·host)')),
+            (('deliv', 'delivery'), ('loss', 'radio loss'), ('wire', 'wire util'),
+             ('ring', 'token cycle')),
         )
         for specs in tile_rows:
             strip = QHBoxLayout()
@@ -507,6 +541,30 @@ class Live(QWidget):
         left.addWidget(cap)
         left.addWidget(self.cam_label, 1)
 
+        # Depth under the colour picture. Shown whenever the RealSense is open
+        # through librealsense; otherwise the panel says why it is dark.
+        if self.has_depth:
+            dcap = QLabel(f'depth · {cam.depth_w}x{cam.depth_h} · '
+                          f'{1000 * cam.depth_scale:g} mm/unit · near red, far blue, '
+                          f'no return black')
+        else:
+            dcap = QLabel('depth · unavailable: '
+                          + getattr(cam, 'depth_reason', 'this camera has no depth stream'))
+            dcap.setWordWrap(True)
+        dcap.setStyleSheet(f'color: {MUTED}; font-size: 13px;')
+        left.addWidget(dcap)
+        self.depth_label = QLabel(alignment=QtCore.Qt.AlignCenter)
+        self.depth_label.setMinimumWidth(360)
+        self.depth_label.setMinimumHeight(120)
+        self.depth_label.setStyleSheet(f'background: {PANEL}; border: 1px solid {BORDER}; '
+                                       'border-radius: 9px;')
+        if not self.has_depth:
+            self.depth_label.setText('no depth stream')
+            self.depth_label.setStyleSheet(
+                f'background: {PANEL}; border: 1px solid {BORDER}; border-radius: 9px; '
+                f'color: {MUTED};')
+        left.addWidget(self.depth_label, 1 if self.has_depth else 0)
+
         root.addLayout(left, 1)
 
         # ---- CSI grid ----
@@ -530,19 +588,67 @@ class Live(QWidget):
             group.addButton(b)
             setup_layout.addWidget(b)
             self.tx_buttons[name] = b
+        # Pings per round-robin turn. Live, because the right value depends on the
+        # handoff cost of the host in front of you, which only the token-cycle tile
+        # can tell you. 0 falls back to the timed dwell for comparison.
+        setup_layout.addWidget(QLabel('pkts/turn'))
+        self.burst_spin = QSpinBox()
+        self.burst_spin.setRange(0, 50)
+        self.burst_spin.setValue(int(args.burst))
+        self.burst_spin.setToolTip(
+            'pings each board sends per round-robin turn before the token moves on '
+            '(firmware "TX <n>", next turn on its TX_DONE). Fewer = shorter token '
+            'cycle = more frames that see every link. 0 = timed --round-duration dwell.')
+        self.burst_spin.valueChanged.connect(self.set_burst)
+        setup_layout.addWidget(self.burst_spin)
+        setup_layout.addWidget(QLabel('guard ms'))
+        self.guard_spin = QDoubleSpinBox()
+        self.guard_spin.setRange(0.0, 20.0)
+        self.guard_spin.setSingleStep(0.5)
+        self.guard_spin.setDecimals(1)
+        self.guard_spin.setValue(float(args.guard))
+        self.guard_spin.setToolTip(
+            'silence after each TX_DONE before the next board sends. Packets are '
+            'lost when the next transmitter follows too closely (measured: 75% '
+            'delivery at 0 ms, 90% at 1, 95% at 3); the token cycle grows 4 ms per ms.')
+        self.guard_spin.valueChanged.connect(self.set_guard)
+        setup_layout.addWidget(self.guard_spin)
         setup_layout.addWidget(QLabel('Hz'))
         self.rate_buttons = {}
         rate_group = QButtonGroup(self)
         rate_group.setExclusive(True)
-        for hz in (100, 200, 300):
+        for hz in (100, 200, 300, 500):
             b = QPushButton(str(hz))
             b.setCheckable(True)
             b.clicked.connect(lambda _c, rate=hz: self.pick_rate_preset(rate))
             rate_group.addButton(b)
             setup_layout.addWidget(b)
             self.rate_buttons[hz] = b
-        self.rate_preset = 100
-        self.rate_buttons[100].setChecked(True)
+        # With counted turns RATE only spaces the pings inside a turn, so the
+        # highest the firmware allows (500 x 4 boards = 2000) is the default at
+        # 5.6 GHz; the 2.4 GHz default stays where its loss was measured lowest.
+        self.rate_preset = 500 if args.band == '5.6' else 300
+        self.rate_buttons[self.rate_preset].setChecked(True)
+
+        # What a take's frames are: depth PNGs (the 3-D pose ground truth), colour
+        # JPEGs with depth beside them, or colour only.
+        setup_layout.addWidget(QLabel('frames'))
+        self.frame_buttons = {}
+        fgroup = QButtonGroup(self)
+        fgroup.setExclusive(True)
+        for kind, text in (('both', 'RGB+DEPTH'), ('colour', 'RGB'), ('depth', 'DEPTH')):
+            b = QPushButton(text)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c, k=kind: self.set_frame_kind(k))
+            fgroup.addButton(b)
+            setup_layout.addWidget(b)
+            self.frame_buttons[kind] = b
+        self.frame_buttons[self.frame_kind].setChecked(True)
+        if not self.has_depth:
+            for k in ('depth', 'both'):
+                self.frame_buttons[k].setEnabled(False)
+                self.frame_buttons[k].setToolTip(
+                    'no depth stream: ' + getattr(cam, 'depth_reason', 'this camera has none'))
 
         self.csi_btn = QPushButton('■ STOP CSI')
         self.csi_btn.setMinimumWidth(147)
@@ -1088,6 +1194,7 @@ class Live(QWidget):
         """
         ser = self.boards[rx]
         st = CsiStream()
+        bad_seen = 0
         while not self.stop.is_set():
             try:
                 data = ser.read(ser.in_waiting or 1)
@@ -1102,6 +1209,7 @@ class Live(QWidget):
                 recs, lines = st.feed(data)
                 for ln in lines:
                     t = ln.decode(errors='ignore').strip()
+                    self.ring.on_line(rx, t)     # TX_DONE: hand the token on
                     if t.startswith('STATS,'):
                         self.on_stats_line(rx, t)
                     elif t.startswith('BAND_OK,'):
@@ -1115,28 +1223,40 @@ class Live(QWidget):
                     elif self.scan is not None:
                         self.on_scan_line(rx, t)
                 now = time.time()
+                if st.bad != bad_seen:
+                    # Frames the parser had to resync past: on a Mac the usual cause
+                    # is the OS serial buffer overflowing while this process was
+                    # busy, and it must show while it happens, not at exit.
+                    self.read_errors += st.bad - bad_seen
+                    bad_seen = st.bad
                 for tx, lts, rssi, amp, clipped, iq, gmeta in recs:
                     key = (tx, rx)
                     self.last_seen[rx] = now
                     self.clipped += clipped
                     self.n_sub = len(amp)
-                    # Slow EMA: the field split is a property of the hardware layout,
-                    # not of what is moving in the room, so it should not chase a
-                    # person walking through the beam.
-                    if amp.size:
+                    self.ring.frame_bytes = 26 + 2 * len(amp)
+                    # Slow EMA and the seen range, on every 8th packet: the field
+                    # split and the scale are properties of the layout, not of one
+                    # packet, and per-packet numpy calls at 3000 packets/s were a
+                    # measurable share of this process's interpreter time.
+                    sampled = getattr(self, '_sample_n', 0) + 1
+                    self._sample_n = sampled
+                    if amp.size and sampled % 8 == 0:
                         lo, hi = float(amp.min()), float(amp.max())
                         if self.seen_max is None or hi > self.seen_max:
                             self.seen_max = hi
                         if self.seen_min is None or lo < self.seen_min:
                             self.seen_min = lo
-                    if self.amp_mean is None or len(self.amp_mean) != len(amp):
-                        self.amp_mean = amp.astype(np.float64)
-                    else:
-                        self.amp_mean *= 0.995
-                        self.amp_mean += 0.005 * amp
+                        if self.amp_mean is None or len(self.amp_mean) != len(amp):
+                            self.amp_mean = amp.astype(np.float64)
+                        else:
+                            self.amp_mean *= 0.96
+                            self.amp_mean += 0.04 * amp
                     rec = self.rec   # single read: stop_record may clear it mid-loop
                     if rec is not None and now >= rec['t0']:
                         rec['recs'][rx].append((now, tx, lts, rssi, amp, iq, gmeta))
+                        if key not in rec['first_packet']:
+                            rec['first_packet'][key] = now
                     with self.lock:
                         if key not in self.buf:
                             continue
@@ -1263,6 +1383,12 @@ class Live(QWidget):
         self.rec_btn.setEnabled(True)
         self.prefix_edit.setEnabled(True)
         self.rec_status.setText(f'protocol {why}')
+        # Everything captured is written now, in the background; the buttons come
+        # back when it is done.
+        if self.pending:
+            self.rec_status.setText(f'protocol {why} — writing {len(self.pending)} takes '
+                                    f'in the background …')
+            self.finalize_pending()
 
     def proto_tick(self):
         """Advance lead-in -> record -> gap -> next take. Driven from the same 30 Hz
@@ -1300,7 +1426,7 @@ class Live(QWidget):
                 p['i'] += 1
                 if p['i'] >= len(p['takes']):
                     return self.abort_protocol(
-                        f'finished — {len(p["takes"])} takes written')
+                        f'finished — {len(p["takes"])} takes captured')
                 p['phase'], p['until'] = LEAD, now + t['lead_in']
             name, instruction = p['takes'][p['i']]
             left = p['until'] - now
@@ -1329,49 +1455,175 @@ class Live(QWidget):
         # t0 is stamped before any thread can append, so every timestamp written is
         # relative to a single instant rather than to whenever a thread first woke.
         t0_ns = time.time_ns()
+        kind = self.frame_kind
         self.rec = dict(prefix=prefix, name=name, t0=t0_ns / 1e9, t0_ns=t0_ns, own=own,
                         recs={m: [] for m in self.macs}, frames=[], idx=0,
+                        first_packet={}, kind=kind, frames_lock=threading.Lock(),
                         jpeg=JpegWriter(f'{prefix}_frames', self.args.quality,
-                                        self.args.encoders, self.args.queue, own,
-                                        self.cam.to_rgb))
+                                        2 if kind == 'depth' else self.args.encoders,
+                                        self.args.queue, own, self.cam.to_rgb,
+                                        kind='depth' if kind == 'depth' else 'rgb'),
+                        depth_frames=[], depth_lock=threading.Lock(),
+                        depth_jpeg=(JpegWriter(f'{prefix}_depth', self.args.quality, 2,
+                                               self.args.queue, own, kind='depth')
+                                    if kind == 'both' else None))
+        if kind != 'colour':
+            # Every depth frame straight from the camera thread, on its own stamp.
+            self.cam.on_depth = self.on_depth
         self.prefix_edit.setEnabled(False)
         self.style_rec_button()
 
+    def frames_ready(self, rec, wall):
+        """Whether a frame at `wall` has a full CSI window behind it: packets on
+        every expected link at least half a period plus one token cycle earlier.
+        Holding the first frame back this way is what keeps frame 0 from being
+        the one frame of every take with an empty window."""
+        n = len(self.macs)
+        want = n * (n - 1) if self.tx_sel == 'round-robin' else n - 1
+        fp = rec['first_packet']
+        if len(fp) < want:
+            return False
+        return wall >= max(fp.values()) + frame_half_window(list(self.frame_times)) + 0.015
+
+    def on_depth(self, frame, ts, seq=0):
+        rec = self.rec
+        if rec is None or rec['kind'] == 'colour' or ts < rec['t0'] \
+                or not self.frames_ready(rec, ts):
+            return
+        if rec['kind'] == 'depth':
+            # the depth frames ARE the frames of the take
+            with rec['frames_lock']:
+                k = rec['idx']
+                rec['idx'] += 1
+                rec['frames'].append((k, seq, ts))
+            rec['jpeg'].submit(k, frame, self.cam.depth_w, self.cam.depth_h)
+            return
+        with rec['depth_lock']:
+            k = len(rec['depth_frames'])
+            rec['depth_frames'].append((k, ts))
+        rec['depth_jpeg'].submit(k, frame, self.cam.depth_w, self.cam.depth_h)
+
     def stop_record(self):
+        """End the take: snapshot what it needs and hand it to the writer. Nothing
+        heavy happens here, so the next take of a protocol starts on time."""
         rec, self.rec = self.rec, None      # readers see None immediately and stop
-        self.prefix_edit.setEnabled(False)
+        if self.has_depth:
+            self.cam.on_depth = None
+        rr = self.tx_sel == 'round-robin'
+        rec['meta'] = dict(
+            t0_epoch=rec['t0'], t0_epoch_ns=rec['t0_ns'], mode=self.tx_sel,
+            round_duration=self.args.round_duration,
+            burst=self.ring.burst if rr else 0,
+            guard_ms=1000 * self.ring.guard if rr else 0,
+            schedule=('pipelined' if self.ring.pipelined else 'gated') if rr else None,
+            ping_rate_hz=self.rate_val,
+            ring_timeouts=self.ring.timeouts if rr else 0,
+            ring_cycle_ms=(round(1000 * float(np.median(list(self.ring.cycles))), 2)
+                           if rr and self.ring.cycles else None),
+            wifi_band_ghz=self.band, wifi_channel=self.channels[self.band],
+            wifi_bandwidth_mhz=self.bw,
+            width=self.cam.w, height=self.cam.h, fps_requested=self.cam.fps,
+            frame_dir=f'{rec["prefix"]}_frames', jpeg_quality=self.args.quality,
+            boards={m: LABEL.get(m[-5:], '?') for m in self.macs},
+            driver_monotonic_ts=bool(self.cam.monotonic),
+            camera_wall_ts=bool(getattr(self.cam, 'wall_ts', False)),
+            camera=getattr(self.cam, 'name', ''),
+            frames=rec['kind'],
+            **camera_gt_meta(self.cam, 'depth' if rec['kind'] == 'depth' else 'rgb'))
+        rec['stopped'] = time.time()
+        self.pending.append(rec)
+        n_pkt = sum(len(v) for v in rec['recs'].values())
+        if self.proto is not None:
+            self.rec_status.setText(f'take {rec["name"]} captured ({len(rec["frames"])} '
+                                    f'frames, {n_pkt} packets) — written after the protocol')
+        else:
+            self.finalize_pending()
+        self.style_rec_button()
+
+    def finalize_pending(self):
+        """Write every captured take, in a background thread, oldest first."""
+        if self.writer is not None and self.writer.is_alive():
+            return                       # it drains self.pending as it goes
+        if not self.pending:
+            return
         self.rec_btn.setEnabled(False)
-        self.rec_status.setText('writing …')
-        QApplication.processEvents()
-        # A reader that read `rec` just before the clear can still be mid-append, and
-        # a list that grows while write_capture iterates it raises. Wait past the
-        # 0.3 s serial timeout, then snapshot, so the writer sees a frozen copy.
-        time.sleep(0.35)
+        self.prefix_edit.setEnabled(False)
+        self.proto_btn.setEnabled(False)
+        self.writer = threading.Thread(target=self._write_pending, daemon=True)
+        self.writer.start()
+
+    def _write_pending(self):
+        total = len(self.pending)
+        done = 0
+        while self.pending:
+            rec = self.pending[0]
+            # A reader that read `rec` just before it was cleared can still be
+            # mid-append for up to the 0.3 s serial timeout; wait that out.
+            wait = rec['stopped'] + 0.4 - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            self.writer_status.emit(f'writing take {done + 1} of {max(total, done + len(self.pending))}: '
+                                    f'{rec["name"]} …')
+            try:
+                path, n_frames, n_pkt, dur, msg = self._write_take(rec)
+                print(f'wrote {path}  ({n_frames} frames, {n_pkt} packets, {dur:.1f}s)',
+                      flush=True)
+            except Exception as e:                       # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                # Never lose a take to a writer bug: keep everything it captured
+                # as a raw pickle beside its frames, to be written by
+                # tools/rewrite_raw.py once the bug is fixed.
+                raw = f'{rec["prefix"]}_raw.pkl'
+                try:
+                    import pickle
+                    with open(raw, 'wb') as fh:
+                        pickle.dump(dict(prefix=rec['prefix'], t0=rec['t0'],
+                                         recs=rec['recs'], frames=rec['frames'],
+                                         depth_frames=rec['depth_frames']
+                                         if rec['depth_jpeg'] is not None else None,
+                                         meta=rec['meta'], own=rec['own']), fh,
+                                    protocol=pickle.HIGHEST_PROTOCOL)
+                    saved = f'raw data kept in {raw}'
+                except Exception as e2:                  # noqa: BLE001
+                    saved = f'and the raw dump failed too: {e2}'
+                msg = (f'<span style="color:#d03b3b">writing {rec["name"]} failed: {e} '
+                       f'— {saved}</span>')
+                print(f'writing {rec["name"]} FAILED: {e} -- {saved}', flush=True)
+            self.pending.pop(0)
+            done += 1
+            self.writer_status.emit(msg)
+        self.writer_done.emit()
+
+    def _write_take(self, rec):
         recs = {k: list(v) for k, v in rec['recs'].items()}
         frames = list(rec['frames'])
+        depth_frames = list(rec['depth_frames']) if rec['depth_jpeg'] is not None else None
         rec['jpeg'].close()
-        meta = dict(t0_epoch=rec['t0'], t0_epoch_ns=rec['t0_ns'], mode=self.tx_sel,
-                    round_duration=self.args.round_duration,
-                    wifi_band_ghz=self.band, wifi_channel=self.channels[self.band],
-                    wifi_bandwidth_mhz=self.bw,
-                    width=self.cam.w, height=self.cam.h, fps_requested=self.cam.fps,
-                    frame_dir=f'{rec["prefix"]}_frames', jpeg_quality=self.args.quality,
-                    boards={m: LABEL.get(m[-5:], '?') for m in self.macs},
-                    driver_monotonic_ts=bool(self.cam.monotonic),
-                    dropped_encode=rec['jpeg'].dropped)
+        if rec['depth_jpeg'] is not None:
+            rec['depth_jpeg'].close()
+        meta = dict(rec['meta'],
+                    dropped_encode=rec['jpeg'].dropped,
+                    dropped_depth_encode=(rec['depth_jpeg'].dropped
+                                          if rec['depth_jpeg'] is not None else 0))
         path, report, ft = write_capture(rec['prefix'], recs, frames,
-                                         rec['t0'], meta, rec['own'])
+                                         rec['t0'], meta, rec['own'],
+                                         depth_frames=depth_frames)
         dur = ft[-1] - ft[0] if len(ft) > 1 else 0.0
         npkt = sum(len(v) for v in recs.values())
         msg = (f'wrote <b>{path}</b> · {len(ft)} frames '
-               f'({len(ft) / max(dur, 1e-9):.1f} fps) · {npkt} packets · {dur:.1f}s')
+               f'({len(ft) / max(dur, 1e-9):.1f} fps)'
+               + (f' + {len(depth_frames)} depth' if depth_frames else '')
+               + f' · {npkt} packets · {dur:.1f}s')
         if rec['jpeg'].dropped:
             msg += f' · <span style="color:#d03b3b">{rec["jpeg"].dropped} frames unencoded</span>'
-        self.rec_status.setText(msg)
-        print(f'wrote {path} and {rec["prefix"]}_frames/  '
-              f'({len(ft)} frames, {npkt} packets, {dur:.1f}s)', flush=True)
-        self.prefix_edit.setEnabled(True)
+        return path, len(ft), npkt, dur, msg
+
+    def on_writer_done(self):
         self.rec_btn.setEnabled(True)
+        self.prefix_edit.setEnabled(True)
+        self.proto_btn.setEnabled(True)
+        self.rec_status.setText(self.rec_status.text() + ' · all takes written')
         self.style_rec_button()
 
     SCAN_DWELL_MS = 500        # per channel; 13 channels, so ~6.5 s a board
@@ -1583,11 +1835,16 @@ class Live(QWidget):
         return ceil // len(self.macs) if self.tx_sel == 'round-robin' else ceil
 
     def preset_hz(self, key):
-        return int(key * len(self.macs) if self.tx_sel == 'round-robin' else key * 3)
+        """The firmware RATE for a per-link preset. A pinned transmitter's receivers
+        carry every ping, so the rate is clamped to what their wire drains: 500/link
+        would ask for 1500 Hz where 3 Mbaud at 117 subcarriers carries ~980."""
+        if self.tx_sel == 'round-robin':
+            return int(key * len(self.macs))
+        return int(min(key * 3, self.wire_ceiling() * 0.85))
 
     def refresh_rate_buttons(self):
         for key, b in self.rate_buttons.items():
-            b.setText(str(key if self.tx_sel == 'round-robin' else key * 3))
+            b.setText(str(key if self.tx_sel == 'round-robin' else self.preset_hz(key)))
 
     def pick_rate_preset(self, key):
         why = self.busy_reason()
@@ -1615,12 +1872,44 @@ class Live(QWidget):
         ok = True
         for m in self.macs:
             try:
-                self.boards[m].write(f'RATE {hz}\n'.encode())
+                with self.command_lock:
+                    self.boards[m].write(f'RATE {hz}\n'.encode())
             except (serial.SerialException, OSError):
                 ok = False
         if ok:
             self.rate_val = hz
+            self.ring.rate_hz = hz      # sizes the TX_DONE timeout
         return ok
+
+    def set_frame_kind(self, kind):
+        """What a take's frames are. Fixed for the length of a take."""
+        if kind == self.frame_kind:
+            return
+        if self.rec is not None or self.proto is not None:
+            self.frame_buttons[self.frame_kind].setChecked(True)
+            self.rec_status.setText(
+                '<span style="color:#ff5555">stop the recording first — what a take '
+                'records cannot change mid-take.</span>')
+            return
+        self.frame_kind = kind
+        self.rec_status.setText('takes record ' + {
+            'depth': 'depth frames (16-bit PNG), no colour',
+            'both': 'colour frames with depth beside them',
+            'colour': 'colour frames only'}[kind])
+
+    def set_guard(self, ms):
+        self.ring.guard = float(ms) / 1000.0
+        self.rec_status.setText(f'round-robin → {float(ms):g} ms guard after each TX_DONE')
+
+    def set_burst(self, n):
+        """Pings per round-robin turn, live. Takes effect on the next turn."""
+        self.ring.burst = int(n)
+        if int(n) > 0:
+            self.rec_status.setText(
+                f'round-robin → {int(n)} pings per turn, next turn on TX_DONE')
+        else:
+            self.rec_status.setText(
+                f'round-robin → timed {self.args.round_duration * 1000:.0f} ms dwell')
 
     def set_sub(self, n):
         """Switch every board's subcarrier count (0 = all 192) AND retune the rate.
@@ -1854,15 +2143,17 @@ class Live(QWidget):
         self.apply_rate_preset(announce=True)
 
     def issue(self, tx):
-        """One board takes the token, everyone else listens for it."""
+        """One board takes the token, everyone else listens for it. Receivers first:
+        the transmitter fires its first ping the moment its line lands."""
         try:
             with self.command_lock:
-                self.boards[tx].write(b'TX\n')
                 for m in self.macs:
                     if m != tx:
                         self.boards[m].write(f'RX {tx.replace(":", "")}\n'.encode())
+                self.boards[tx].write(b'TX\n')
         except (serial.SerialException, OSError):
             return False
+        self.ring.disarm()      # the receiver lists were just overwritten
         return True
 
     def idle_all(self):
@@ -1880,10 +2171,11 @@ class Live(QWidget):
                     self.boards[m].write(b'RX 000000000000\n')
         except (serial.SerialException, OSError):
             return False
+        self.ring.disarm()      # the receiver lists were just overwritten
         return True
 
     def radio(self):
-        i, last = 0, None
+        last = None
         stats_at = 0.0
         while not self.stop.is_set():
             # Counters live on the boards; poll them onto the strip. Cheap: one
@@ -1906,12 +2198,13 @@ class Live(QWidget):
                 continue
             sel = self.tx_sel
             if sel == 'round-robin':
-                tx = self.macs[i % len(self.macs)]
-                i += 1
-                if not self.issue(tx):
+                if last != 'rr':
+                    # Coming from pinned or parked: the boards hold other roles,
+                    # so the ring re-arms every receiver list before its first turn.
+                    self.ring.disarm()
+                    last = 'rr'
+                if not self.ring.turn():
                     return
-                last = None
-                self.stop.wait(self.args.round_duration)
             else:
                 # Pinned: issue only on change. Re-sending TX to the board that
                 # already holds it restarts its ping timer and emits another
@@ -1931,20 +2224,28 @@ class Live(QWidget):
             if got is None:
                 continue
             seq, ts, buf = got
+            # The depth frame that arrived in the same frameset, if any.
+            depth = self.cam.depth if self.has_depth else None
             rec = self.rec
-            if rec is not None:
-                # Same clock discipline as capture_synced: the driver's DMA-completion
-                # timestamp, not the moment this thread got round to looking.
-                wall = ts + self.mono_offset if self.cam.monotonic else time.time()
-                # A frame already queued in the driver can predate the button press;
-                # exclude it so every shared-origin timestamp is non-negative.
-                if wall >= rec['t0']:
-                    rec['frames'].append((rec['idx'], seq, wall))
-                    rec['jpeg'].submit(rec['idx'], buf, self.cam.w, self.cam.h)
-                    rec['idx'] += 1
+            if rec is not None and rec['kind'] != 'depth':
+                # Same clock discipline as capture_synced: the camera's own wall
+                # stamp or the driver's DMA-completion timestamp, not the moment
+                # this thread got round to looking.
+                wall = frame_wall(self.cam, ts, self.mono_offset)
+                # A frame already queued in the driver can predate the button press,
+                # and the first frames arrive before every link has packets behind
+                # them; both are left out so every frame has a full window.
+                if wall >= rec['t0'] and self.frames_ready(rec, wall):
+                    with rec['frames_lock']:
+                        k = rec['idx']
+                        rec['idx'] += 1
+                        rec['frames'].append((k, seq, wall))
+                    rec['jpeg'].submit(k, buf, self.cam.w, self.cam.h)
             rgb = self.cam.to_rgb(buf, self.cam.w, self.cam.h)
+            dview = self.cam.depth_rgb() if depth is not None else None
             with self.lock:
                 self.frame = rgb
+                self.depth_view = dview
                 self.frame_times.append(time.time())
 
     # ---- render ----
@@ -1987,6 +2288,14 @@ class Live(QWidget):
 
     def on_tick(self):
         now = time.time()
+        # While a take records, redraw the panels at half rate: the encoders and
+        # the camera threads need the interpreter more than the waterfalls do, and
+        # dropped camera frames were traced to this process being busy.
+        self._tick = getattr(self, '_tick', 0) + 1
+        if self.rec is not None and self._tick % 2:
+            if self.proto is not None:
+                self.proto_tick()
+            return
 
         if self.scan is not None:
             self.scan_tick(now)
@@ -2012,6 +2321,7 @@ class Live(QWidget):
         # Camera first and unconditionally, independent of the CSI panels.
         with self.lock:
             frame = self.frame
+            dview = self.depth_view
             ftimes = list(self.frame_times)
         if frame is not None:
             h, w, _ = frame.shape
@@ -2021,6 +2331,13 @@ class Live(QWidget):
             qi = QImage(raw, w, h, 3 * w, QImage.Format_RGB888)
             self.cam_label.setPixmap(QPixmap.fromImage(qi).scaled(
                 self.cam_label.width(), self.cam_label.height(),
+                QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        if dview is not None:
+            dh, dw, _ = dview.shape
+            draw = dview.tobytes()
+            dqi = QImage(draw, dw, dh, 3 * dw, QImage.Format_RGB888)
+            self.depth_label.setPixmap(QPixmap.fromImage(dqi).scaled(
+                self.depth_label.width(), self.depth_label.height(),
                 QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
         self.cam_fps.adjustSize()
         self.cam_fps.move(max(self.cam_label.width() - self.cam_fps.width() - 12, 0), 12)
@@ -2159,8 +2476,19 @@ class Live(QWidget):
         total_rate = sum(rates)
         self.tiles['rate'].set(f'{np.mean(rates):.0f} Hz' if rates else '—')
 
+        # Count-based round-robin: the boards ping only while they hold a burst, so
+        # "rate x seconds" overstates what was sent by the handoff dead time. The
+        # ring knows exactly how many pings it commanded and saw completed.
+        bursting = active_tx is None and self.ring.burst > 0
         if self.csi_on and self.rate_val and rates:
-            expected = self.rate_val * max(len(self.macs) - 1, 1)
+            if bursting:
+                pings = sum(n for t, n, _tx in list(self.ring.completed) if t >= cutoff)
+                expected = pings * max(len(self.macs) - 1, 1)
+            else:
+                expected = self.rate_val * max(len(self.macs) - 1, 1)
+        else:
+            expected = 0
+        if expected > 0:
             deliv = 100.0 * total_rate / expected
             self.tiles['deliv'].set(f'{min(deliv, 100):.1f}%',
                                     GOOD if deliv >= 97 else WARN if deliv >= 90 else BAD)
@@ -2169,14 +2497,19 @@ class Live(QWidget):
 
         # Radio loss over the same trailing second as the Hz tile, using the boards'
         # hardware receive clocks. Consecutive-arrival steps are measured in ping
-        # periods; steps past 8 periods are the round-robin blind gap (schedule, not
-        # loss) and are excluded.
+        # periods; steps past the burst are the round-robin blind gap (schedule, not
+        # loss) and are excluded: up to 8 periods for a timed dwell, up to burst-1
+        # for count-based turns. A burst of one has no intra-burst step to judge by;
+        # the delivery tile carries the loss figure then.
+        max_step = (self.ring.burst - 1) if bursting else 8
         sent = got = 0
         per_loss = {}
         for key, (h, lts) in links.items():
+            if max_step < 1:
+                break
             recent = lts[h >= cutoff]
             st = np.rint(np.diff(np.sort(recent)) * self.rate_val).astype(int)
-            st = st[(st >= 1) & (st <= 8)]
+            st = st[(st >= 1) & (st <= max_step)]
             link_sent, link_got = int(st.sum()), len(st)
             sent += link_sent
             got += link_got
@@ -2195,6 +2528,40 @@ class Live(QWidget):
         gaps = [np.percentile(np.diff(h) * 1000, 99) for h, _ in links.values()
                 if len(h) > 10]
         self.tiles['gap'].set(f'{max(gaps):.0f} ms' if gaps else '—')
+
+        # Frame coverage: of the last second's camera frames, how many carried a
+        # packet on EVERY expected link within half a frame period of the frame
+        # (disjoint windows, one per frame). Per-link rate cannot answer that -- a
+        # link at 100 Hz in 25 ms bursts still leaves most frames without it.
+        # Frames newer than the window are left out: their packets are still coming.
+        want = [(tx, rx) for tx in self.macs for rx in self.macs
+                if tx != rx and (active_tx is None or tx == active_tx)]
+        half = frame_half_window(ftimes)
+        recent_frames = [t for t in ftimes if cutoff <= t <= now - half]
+        if self.csi_on and want and len(recent_frames) >= 3:
+            link_t = {k: h for k, (h, _l) in links.items()}
+            cover, _per = frame_coverage(recent_frames, link_t, want, half)
+            self.tiles['cover'].set(f'{100 * cover:.0f}%',
+                                    GOOD if cover >= 0.95 else WARN if cover >= 0.8 else BAD)
+        else:
+            self.tiles['cover'].set('—')
+
+        # The token cycle must beat a camera frame for every frame to see every
+        # link; with 4 boards and 2 pings a turn the whole cycle is the handoff cost.
+        ring = self.ring
+        new_timeouts = ring.timeouts - self.ring_timeouts_seen
+        self.ring_timeouts_seen = ring.timeouts
+        if self.csi_on and active_tx is None and ring.cycles:
+            cyc = 1000 * float(np.median(list(ring.cycles)))
+            frame_ms = 1000 / max(self.cam.fps, 1)
+            text = f'{cyc:.0f} ms'
+            if ring.timeouts:
+                text += f' · {ring.timeouts} t/o'
+            self.tiles['ring'].set(text, BAD if new_timeouts else
+                                   GOOD if cyc <= frame_ms else WARN if cyc <= 2 * frame_ms
+                                   else BAD)
+        else:
+            self.tiles['ring'].set('—')
 
         # Each receiving board owns its own 8N1 UART; show the busiest one.
         frame_bytes = 26 + 2 * max(self.n_sub, 1)
@@ -2215,6 +2582,19 @@ class Live(QWidget):
             board += current - base
         host = self.read_errors + self.clipped - self.drop_host_base
         self.tiles['drops'].set(f'{board}·{host}', None if not (board or host) else BAD)
+        # The same numbers on stdout every 5 s, so a session's health can be read
+        # back from the log after the fact.
+        if now - getattr(self, '_health_logged', 0) > 5:
+            self._health_logged = now
+            per_board = ' '.join(f'{LABEL.get(m[-5:], m)}:{d.get("framedrops", 0)}/'
+                                 f'{d.get("textdrops", 0)}/{d.get("sendfail", 0)}'
+                                 for m, d in stats.items())
+            print(f'[health] tx={self.tx_sel} rate={self.rate_val} per-link='
+                  f'{np.mean(rates) if rates else 0:.0f}Hz min={min(rates) if rates else 0:.0f} '
+                  f'deliv={100.0 * total_rate / expected if expected else 0:.1f}% '
+                  f'loss={100.0 * (sent - got) / sent if sent else 0:.1f}% '
+                  f'wire={100 * util:.0f}% host_errors={self.read_errors} '
+                  f'boards(framedrops/textdrops/sendfail) {per_board}', flush=True)
 
         cam_fps = 0.0
         if len(ftimes) > 2:
@@ -2234,9 +2614,15 @@ class Live(QWidget):
     def closeEvent(self, ev):
         if self.proto is not None:
             self.abort_protocol('window closed')
-        # Never drop a run on the floor because the window was closed.
+        # Never drop a run on the floor because the window was closed: finish the
+        # take and write everything still pending before the window goes.
         if self.rec is not None:
             self.stop_record()
+        if self.pending or (self.writer is not None and self.writer.is_alive()):
+            print(f'writing {len(self.pending)} pending take(s) before closing …', flush=True)
+            self.finalize_pending()
+            if self.writer is not None:
+                self.writer.join()
         self.stop.set()
         time.sleep(0.35)
         try:
@@ -2261,10 +2647,14 @@ def main():
     ap.add_argument('--width', type=int, default=1280)
     ap.add_argument('--height', type=int, default=720)
     ap.add_argument('--fps', type=float, default=30.0)
-    ap.add_argument('--refresh', type=float, default=30.0, help='GUI redraw rate (Hz)')
+    ap.add_argument('--refresh', type=float, default=15.0,
+                    help='GUI redraw rate (Hz); halved again while a take records. The '
+                         'serial readers share the interpreter with the redraw, and at '
+                         '30 Hz a pinned transmitter\'s 3000 packets/s were losing '
+                         'up to a third of them to OS buffer overflow while idle.')
     ap.add_argument('--bw', type=int, default=40, choices=(20, 40),
                     help='the bandwidth the firmware boots on (CONFIG_WIFI_BANDWIDTH)')
-    ap.add_argument('--band', default='2.4', choices=('2.4', '5.6'),
+    ap.add_argument('--band', default='5.6', choices=('2.4', '5.6'),
                     help='initial radio selection; 5.6 requires ESP32-C5 boards')
     ap.add_argument('--channel', type=int, default=13,
                     help='the 2.4 GHz channel the firmware boots on, so the survey can '
@@ -2272,10 +2662,34 @@ def main():
     ap.add_argument('--tx', default='round-robin',
                     help='"round-robin", or a discovered board label to pin the '
                          'transmitter. Switchable in the GUI at any time.')
+    ap.add_argument('--burst', type=int, default=None,
+                    help='pings each board sends per round-robin turn (firmware '
+                         '"TX <n>", next turn on its TX_DONE). Measured while recording: '
+                         'at 5.6 GHz / 40 MHz / RATE 2000, 4 a turn covers every frame '
+                         'with 5-10 packets per link (~310 Hz/link, no loss); at 2.4 '
+                         'GHz 2 a turn is the most that still covers every frame. '
+                         'Default 4 at 5.6 GHz, 2 at 2.4; adjustable live in the GUI. '
+                         '0 = timed --round-duration dwell.')
+    ap.add_argument('--guard', type=float, default=None,
+                    help='ms of silence after a TX_DONE before the next board sends; '
+                         'see capture.py. Default 0.5 at 5.6 GHz, 1.0 at 2.4; '
+                         'adjustable live in the GUI.')
+    ap.add_argument('--schedule', choices=('pipelined', 'gated'), default='pipelined',
+                    help='see capture.py; pipelined keeps the ring turning on the '
+                         'boards\' own timers while the GUI is busy')
     ap.add_argument('--round-duration', type=float, default=0.025,
-                    help='seconds each board holds the transmit token; sets the blind '
-                         'gap between a link\'s bursts. 25 ms is the measured optimum '
-                         'for 166 subcarriers, 12.5 ms for 30 -- see capture.py.')
+                    help='with --burst 0: seconds each board holds the transmit '
+                         'token. Four boards at 25 ms go round in ~100 ms, so a 33 ms '
+                         'frame sees only one or two transmitters -- see capture.py.')
+    ap.add_argument('--frames', choices=('both', 'colour', 'depth'), default='both',
+                    help='what a take\'s frames are: colour JPEGs with depth PNGs '
+                         'beside them (default; 3-D pose needs both), colour alone, '
+                         'or depth alone. Switchable in the GUI between takes.')
+    ap.add_argument('--depth', action='store_true',
+                    help='open the RealSense depth stream in this process through '
+                         'librealsense. Not needed when tools/depth_server.py is '
+                         'running (the normal way on a Mac, where librealsense needs '
+                         'root): its depth stream is attached automatically.')
     ap.add_argument('--prefix', default='run', help='default capture name in the GUI')
     ap.add_argument('--outdir', default=None,
                     help='directory for captures (default: the repo data/ folder)')
@@ -2301,6 +2715,13 @@ def main():
     args = ap.parse_args()
     if args.outdir is None:
         args.outdir = default_outdir()
+    print(f'captures go to {args.outdir}', flush=True)
+    # The schedule that measured best on each band (NOTES.md, 2026-09-16); an
+    # explicit value always wins.
+    if args.burst is None:
+        args.burst = 4 if args.band == '5.6' else 2
+    if args.guard is None:
+        args.guard = 0.5 if args.band == '5.6' else 1.0
     if args.projdir is None:
         args.projdir = default_projdir()
 
@@ -2315,12 +2736,7 @@ def main():
     labels = [LABEL.get(m[-5:], m) for m in sorted(boards)]
     n_links = len(boards) * (len(boards) - 1)
     print(f'{len(boards)} boards: {labels} -> {n_links} links', flush=True)
-    if all(m in C5_MACS for m in boards):
-        expected = {'F', 'G', 'H', 'I'}
-    elif all(m not in C5_MACS for m in boards):
-        expected = {'A', 'B', 'C', 'D'}
-    else:
-        expected = None
+    expected = {'A', 'B', 'C', 'D'} if all(m in C5_MACS for m in boards) else None
     missing = sorted(expected - set(labels)) if expected else []
     if missing:
         # Missing boards are silent in the panels -- they simply are not drawn -- and
@@ -2329,8 +2745,12 @@ def main():
         print(f'note: {", ".join(missing)} not connected; recording {n_links} of '
               f'{len(expected) * (len(expected) - 1)} links', flush=True)
 
-    cam = open_camera(dev, args.width, args.height, args.fps)
+    cam = open_camera(dev, args.width, args.height, args.fps, depth=args.depth)
     print(f'camera {cam.name} {cam.w}x{cam.h} @ {cam.fps:g} fps', flush=True)
+    # The ring thread competes with the encoders, the camera threads and the GUI
+    # for the interpreter lock; switch ten times as often as Python's default 5 ms
+    # so a TX_DONE already in hand is acted on within a millisecond or two.
+    sys.setswitchinterval(0.0005)
     app = QApplication(sys.argv)
     w = Live(boards, cam, args)
     w.show()

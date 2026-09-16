@@ -17,12 +17,36 @@
    a dropped handoff could stall the whole ring. Reliable wired UART sidesteps
    that entirely.
 
-   Two commands, one line each over the console UART:
+   Role commands, one line each over the console UART:
      TX                 -- this board becomes the token holder: broadcasts
-                            CSI-trigger pings and lights its LED blue.
-     RX <mac_hex>        -- this board becomes/stays a receiver, filtering CSI
-                            for the given MAC (the current token holder), LED red.
-   <mac_hex> is 12 hex chars, no separators, e.g. ecda3b4cb8d0.
+                            CSI-trigger pings at RATE until told otherwise, LED blue.
+     TX <n> [tag [delay_us]]
+                        -- burst: send exactly n pings at RATE, then stop and go back
+                            to receiving (filter untouched) without waiting for the
+                            host. Emits TX_DONE,<n>,<tag> after the n-th ping is
+                            handed to the radio. The tag (default 0) is echoed so a
+                            late TX_DONE can never be mistaken for another turn.
+                            With delay_us the burst starts that many microseconds
+                            after the line arrived, from a queue of up to 8 pending
+                            starts: the host schedules whole cycles ahead of time
+                            and the boards keep the ring turning on their own
+                            timers, so a busy host cannot leave holes in it. No LED
+                            change: at 100+ turns a second that is flicker, not
+                            information.
+     PEERS <mac_hex>[,<mac_hex>...]
+                        -- set the CSI filter list without touching the role or any
+                            pending burst (the once-a-second re-arm in ring mode).
+                            RX does the same but also stops everything.
+     RX <mac_hex>[,<mac_hex>...]
+                        -- receiver: stop pinging and accept CSI from ANY listed MAC
+                            (up to 8). The host arms every board once with the list
+                            of every other board, so a token handoff is one TX
+                            line to one board and receivers never need to be told
+                            who is next -- which is also why the first ping of a
+                            burst is no longer lost to a filter that still names
+                            the previous transmitter. LED red.
+   <mac_hex> is 12 hex chars, no separators, e.g. ecda3b4cb8d0. The all-zero MAC
+   matches nothing, so "RX 000000000000" parks a board.
 
    Also:
      RATE <hz>          -- retune the ping rate live.
@@ -300,7 +324,7 @@ static void emit(const void *buf, size_t len)
 
 static void emit_textf(const char *fmt, ...)
 {
-    char line[160];
+    char line[256];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
@@ -332,10 +356,37 @@ static uint8_t agc_base = 0;
 static int8_t fft_base = 0;
 static volatile bool base_ready = false;
 static volatile bool agc_locked = false;
-static uint8_t tx_filter_mac[6] = {0}; // whichever MAC we should currently accept CSI from
+// The MACs we accept CSI from: every other board in the ring, set once by the host
+// with "RX a,b,c". It used to be a single MAC rewritten on every handoff, which
+// meant three RX lines per turn and a first ping that always landed before the
+// receivers had switched. n_filter is written last by the command task and read by
+// the WiFi task; a torn read costs at most one frame, never a wrong one (the frame
+// carries the real transmitter MAC regardless).
+#define MAX_FILTER 8
+static uint8_t tx_filter[MAX_FILTER][6];
+static volatile int n_filter = 0;
 static led_strip_handle_t led_strip;
 static esp_timer_handle_t ping_timer;
 static void ping_timer_cb(void *arg);   // become_tx() fires one ping directly
+// Burst mode ("TX <n>"): pings still to send in this turn, 0 = continuous (plain
+// "TX"). The n-th ping stops the timer, clears is_tx and emits TX_DONE, so the token
+// hands itself back without a host round trip and every turn carries exactly n
+// pings -- the host's timer used to decide that, and it jittered.
+static volatile uint32_t burst_left = 0;
+static volatile uint32_t burst_len = 0;
+static volatile uint32_t burst_tag = 0;
+// Bursts scheduled ahead by the host ("TX n tag delay_us"): a small FIFO of
+// absolute start times on the esp_timer clock. The command task only appends at
+// the tail; a 200 us periodic timer (start_timer, running from boot) pops the head
+// when its time has come. Nothing re-arms a timer across tasks -- the first
+// version did, and a burst occasionally fired twice or late. Clearing the queue
+// (RX, SCAN) is a flag for the timer task for the same reason.
+#define PENDING_MAX 8
+#define START_POLL_US 200
+static struct { uint32_t n, tag; int64_t at; } pending[PENDING_MAX];
+static volatile int pending_head = 0, pending_tail = 0;   // ring indices, mod PENDING_MAX
+static volatile bool pending_clear = false;
+static esp_timer_handle_t start_timer;
 // Ping period, settable at runtime with "RATE <hz>". The UART ceiling is an empirical
 // number -- bandwidth arithmetic has already been shown to be necessary but not
 // sufficient here -- so it has to be swept against real corruption counts, and
@@ -363,43 +414,114 @@ static void init_led(void)
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
 }
 
-static void become_tx(void)
+// n == 0: hold the token until told otherwise (fixed-TX mode and the legacy timed
+// dwell). n > 0: send exactly n pings and hand the token back by ourselves.
+//
+// The filter list is deliberately NOT cleared here any more. The old single-MAC
+// version zeroed it so a late packet from the previous holder could not be logged
+// against our own TX span; that is now covered by the is_tx check in the CSI
+// callback alone, and keeping the list means a board hears the next transmitter the
+// instant its own burst ends, with no host command in between.
+static void become_tx(uint32_t n, uint32_t tag)
 {
+    esp_timer_stop(ping_timer); // ignored if not running
+    burst_len = n;
+    burst_left = n;
+    burst_tag = tag;
     is_tx = true;
-    // Invalidate the CSI filter so stray/late packets from whoever we were
-    // previously told to receive from (which may not have processed its own
-    // "become RX" command yet) don't get recorded as if captured during our
-    // own TX span. No real board has an all-zero MAC, so nothing can match.
-    memset(tx_filter_mac, 0, sizeof(tx_filter_mac));
-    if (!ident_mode) {
+    if (n == 0 && !ident_mode) {
         set_led(0, 0, 40); // blue = holding the TX token
     }
-    esp_timer_stop(ping_timer); // ignored if not running
-    ESP_ERROR_CHECK(esp_timer_start_periodic(ping_timer, ping_period_us));
     // Fire once immediately: a periodic timer's first callback lands one full period
     // after the start, so restarting it on every handoff left the first interval of
     // every dwell silent. At a 50 ms dwell that was 40% of the turn, and it is why
-    // each turn yielded ~1.3 of the 2.5 packets it should.
+    // each turn yielded ~1.3 of the 2.5 packets it should. The direct call runs on
+    // this (command) task; the periodic timer is started only afterwards, so the
+    // two never decrement burst_left concurrently. A burst of one is complete
+    // before the timer would have been started at all.
     ping_timer_cb(NULL);
-    // Same driver ring as the CSI frames, so a role marker orders exactly with the
-    // records around it -- the host decides which dwell a packet belongs to from this.
-    emit_textf("ROLE_TX\n");
+    if (is_tx) {
+        ESP_ERROR_CHECK(esp_timer_start_periodic(ping_timer, ping_period_us));
+    }
+    if (n == 0) {
+        // Same driver ring as the CSI frames, so a role marker orders exactly with
+        // the records around it. Bursts announce their end instead (TX_DONE).
+        emit_textf("ROLE_TX\n");
+    }
 }
 
-static void become_rx(const uint8_t *peer_mac)
+static void set_filter(const uint8_t macs[][6], int n);
+
+static void become_rx(const uint8_t macs[][6], int n)
 {
     is_tx = false;
-    memcpy(tx_filter_mac, peer_mac, 6);
+    burst_left = 0;
+    esp_timer_stop(ping_timer); // ignored if not running
+    pending_clear = true;              // nothing scheduled survives a park/pin
+    // Count first to zero, then the entries, then the count: the WiFi task may run
+    // the CSI callback between any two of these and must never index a stale entry.
+    n_filter = 0;
+    if (n > MAX_FILTER) {
+        n = MAX_FILTER;
+    }
+    for (int i = 0; i < n; i++) {
+        memcpy(tx_filter[i], macs[i], 6);
+    }
+    n_filter = n;
     if (!ident_mode) {
         set_led(40, 0, 0); // red = receiving
     }
-    esp_timer_stop(ping_timer); // ignored if not running
-    emit_textf("ROLE_RX," MACSTR "\n", MAC2STR(tx_filter_mac));
+    char reply[16 + MAX_FILTER * 18];
+    int len = snprintf(reply, sizeof(reply), "ROLE_RX,%d", n);
+    for (int i = 0; i < n && len < (int)sizeof(reply) - 20; i++) {
+        len += snprintf(reply + len, sizeof(reply) - len, "," MACSTR, MAC2STR(tx_filter[i]));
+    }
+    emit_textf("%s\n", reply);
+}
+
+// The filter list alone: what the host re-sends once a second in ring mode so a
+// rebooted board hears again, without cancelling the bursts it already scheduled.
+static void set_filter(const uint8_t macs[][6], int n)
+{
+    n_filter = 0;
+    if (n > MAX_FILTER) {
+        n = MAX_FILTER;
+    }
+    for (int i = 0; i < n; i++) {
+        memcpy(tx_filter[i], macs[i], 6);
+    }
+    n_filter = n;
+    emit_textf("PEERS_OK,%d\n", n);
+}
+
+// Every START_POLL_US: start whatever is due. Only this task moves the head.
+static void start_timer_cb(void *arg)
+{
+    if (pending_clear) {
+        pending_head = pending_tail;
+        pending_clear = false;
+        return;
+    }
+    if (pending_head == pending_tail) {
+        return;
+    }
+    if (pending[pending_head].at > esp_timer_get_time()) {
+        return;
+    }
+    uint32_t n = pending[pending_head].n, tag = pending[pending_head].tag;
+    pending_head = (pending_head + 1) % PENDING_MAX;
+    become_tx(n, tag);
 }
 
 static void ping_timer_cb(void *arg)
 {
     static uint32_t seq = 0;
+    if (!is_tx) {
+        // A periodic callback already queued when RX (or the burst's own end)
+        // stopped the timer. One stray ping would be logged by the receivers under
+        // our MAC in the next holder's turn; not harmful, but not asked for either.
+        return;
+    }
     esp_err_t ret = esp_now_send(BROADCAST_MAC, (const uint8_t *)&seq, sizeof(seq));
     seq++;
     if (ret != ESP_OK) {
@@ -407,6 +529,17 @@ static void ping_timer_cb(void *arg)
         // and formatting a log line there blocked ~0.76 ms per failure -- jittering
         // the very pings that were already failing. STATS reports it.
         send_fails++;
+    }
+    if (burst_left && --burst_left == 0) {
+        // The burst is complete: hand the token back without waiting for the host.
+        // Stopping a periodic timer from inside its own callback is fine: esp_timer
+        // re-inserts the timer before dispatching the callback and takes the list
+        // lock again afterwards, so the stop simply removes the next alarm.
+        is_tx = false;
+        esp_timer_stop(ping_timer); // ESP_ERR_INVALID_STATE for a burst of one: not started
+        // esp_now_send only queues the frame; the radio sends it within a few hundred
+        // microseconds, well inside the host's USB round trip to the next board.
+        emit_textf("TX_DONE,%u,%u\n", (unsigned)burst_len, (unsigned)burst_tag);
     }
 }
 
@@ -690,7 +823,9 @@ static void do_scan(uint32_t dwell_ms)
     // rig is not listening on is pure interference, and a board that resumed pinging
     // mid-survey would measure itself.
     is_tx = false;
+    burst_left = 0;
     esp_timer_stop(ping_timer);
+    pending_clear = true;
     esp_wifi_set_csi(false);
     esp_wifi_set_promiscuous_rx_cb(promisc_rx_cb);
     // HT20 for the survey: a 40 MHz capture smears two channels into one number, and
@@ -718,14 +853,17 @@ static void do_scan(uint32_t dwell_ms)
 
     esp_wifi_set_csi(true);
     // Left as a receiver of nobody on purpose: a survey takes seconds, the host's
-    // schedule has moved on, and it issues the next TX/RX itself.
-    memset(tx_filter_mac, 0, sizeof(tx_filter_mac));
+    // schedule has moved on, and it re-arms the filter list and issues the next
+    // TX/RX itself.
+    n_filter = 0;
     emit_textf("SCAN_DONE,%u\n", (unsigned)cur_channel);
 }
 
 static void uart_command_task(void *arg)
 {
-    char line[64];
+    // "RX " plus eight comma-separated 12-hex MACs is 107 characters; the old 64
+    // would have split that line in two and rejected both halves.
+    char line[160];
     while (1) {
         if (fgets(line, sizeof(line), stdin) == NULL) {
             // A UART RX overrun latches the stream's error flag, after which fgets
@@ -746,11 +884,62 @@ static void uart_command_task(void *arg)
         line[strcspn(line, "\r\n")] = '\0';
 
         if (strcmp(line, "TX") == 0) {
-            become_tx();
+            become_tx(0, 0);
+        } else if (strncmp(line, "TX ", 3) == 0) {
+            // TX <n> [tag [delay_us]]: a burst of n pings, then back to receiving.
+            // 1000 is far above any useful burst (the point is short turns) and
+            // keeps a typo from pinning a board as transmitter for minutes. With a
+            // delay the burst is queued to start that far in the future.
+            unsigned n = 0, tag = 0, delay = 0;
+            int got = sscanf(line + 3, "%u %u %u", &n, &tag, &delay);
+            if (got < 1 || n < 1 || n > 1000) {
+                ESP_LOGW(TAG, "bad TX command: '%s'", line);
+            } else if (got < 3 || delay == 0) {
+                become_tx(n, tag);
+            } else if ((pending_tail + 1) % PENDING_MAX == pending_head) {
+                ESP_LOGW(TAG, "TX queue full, dropped tag %u", tag);
+            } else {
+                pending[pending_tail].n = n;
+                pending[pending_tail].tag = tag;
+                pending[pending_tail].at = esp_timer_get_time() + (int64_t)delay;
+                pending_tail = (pending_tail + 1) % PENDING_MAX;
+            }
+        } else if (strncmp(line, "PEERS ", 6) == 0) {
+            uint8_t macs[MAX_FILTER][6];
+            int n = 0;
+            bool ok = true;
+            char *save = NULL;
+            for (char *tok = strtok_r(line + 6, ",", &save); tok;
+                 tok = strtok_r(NULL, ",", &save)) {
+                if (n >= MAX_FILTER || !parse_hex_mac(tok, macs[n])) {
+                    ok = false;
+                    break;
+                }
+                n++;
+            }
+            if (ok && n > 0) {
+                set_filter(macs, n);
+            } else {
+                ESP_LOGW(TAG, "bad PEERS command: '%s'", line);
+            }
         } else if (strncmp(line, "RX ", 3) == 0) {
-            uint8_t mac[6];
-            if (parse_hex_mac(line + 3, mac)) {
-                become_rx(mac);
+            // RX <mac>[,<mac>...]: the set of transmitters to accept CSI from. One
+            // bad entry rejects the whole line rather than silently arming a subset:
+            // a receiver deaf to one board is the failure check_session exists for.
+            uint8_t macs[MAX_FILTER][6];
+            int n = 0;
+            bool ok = true;
+            char *save = NULL;
+            for (char *tok = strtok_r(line + 3, ",", &save); tok;
+                 tok = strtok_r(NULL, ",", &save)) {
+                if (n >= MAX_FILTER || !parse_hex_mac(tok, macs[n])) {
+                    ok = false;
+                    break;
+                }
+                n++;
+            }
+            if (ok && n > 0) {
+                become_rx(macs, n);
             } else {
                 ESP_LOGW(TAG, "bad RX command: '%s'", line);
             }
@@ -876,17 +1065,24 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
-    // Never record while we ourselves hold the TX token. This is deliberately not just
-    // "tx_filter_mac is zeroed in become_tx()": promiscuous mode can loop a station's own
-    // outgoing frames back through this callback, and if that self-loopback happens to
-    // report info->mac as all-zero too, a zeroed filter would start matching it instead
-    // of blocking it. Checking is_tx directly has no such edge case.
+    // Never record while we ourselves hold the TX token. Promiscuous mode can loop a
+    // station's own outgoing frames back through this callback, and our own MAC is
+    // never in the filter list -- but a burst ends by clearing is_tx from the timer
+    // task, and this check is what keeps the last ping of our own burst from being
+    // logged against us if it loops back late. Checking is_tx directly has no edge
+    // case a filter-list lookup could introduce.
     if (is_tx) {
         return;
     }
 
-    // Only keep CSI from whoever we were last told currently holds the TX token.
-    if (memcmp(info->mac, tx_filter_mac, 6)) {
+    // Only keep CSI from the boards the host armed us for. Anything else on the
+    // channel (APs, phones, another rig) also triggers this callback.
+    bool wanted = false;
+    int nf = n_filter;
+    for (int i = 0; i < nf && !wanted; i++) {
+        wanted = memcmp(info->mac, tx_filter[i], 6) == 0;
+    }
+    if (!wanted) {
         return;
     }
 
@@ -1172,6 +1368,12 @@ void app_main(void)
         .name = "rr_ping",
     };
     ESP_ERROR_CHECK(esp_timer_create(&ping_timer_args, &ping_timer));
+    const esp_timer_create_args_t start_timer_args = {
+        .callback = &start_timer_cb,
+        .name = "rr_start",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&start_timer_args, &start_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(start_timer, START_POLL_US));
 
     xTaskCreate(uart_command_task, "uart_cmd", 4096, NULL, 5, NULL);
 

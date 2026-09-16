@@ -17,15 +17,42 @@ import zipfile
 
 import numpy as np
 
-# Widths the firmware is known to emit: 192 amplitudes (frame v1) or the 30-subcarrier
-# subset (v2 I/Q). Pinning one number here would fail every capture the moment the
-# encoding changed, so what is enforced is that every link within a take agrees --
-# a take that mixes widths is broken in a way no single expected value would catch.
-KNOWN_SUB = (192, 166, 30)
+# Widths the firmware is known to emit: 192 amplitudes (frame v1), the 166 / 114 / 30
+# subsets on the S3 boards, and on the C5 boards every HT-LTF subcarrier the radio
+# returns: 117 at HT40, 57 at HT20. Pinning one number here would fail every capture
+# the moment the encoding changed, so what is enforced is that every link within a
+# take agrees -- a take that mixes widths is broken in a way no single expected
+# value would catch.
+KNOWN_SUB = (192, 166, 117, 114, 57, 30)
 
 
 def links(d):
     return sorted({k.rsplit('|', 1)[0] for k in d.files if k.endswith('|t')})
+
+
+# A frame's CSI is everything within half a frame period of its timestamp, either
+# side: windows centred on consecutive frames tile the timeline without overlap.
+# Same definition as frame_coverage in capture.py -- duplicated so this script
+# stays importable without pyserial and the camera stack.
+FRAME_WINDOW_S = 1 / 60          # the 30 fps value, used with fewer than 2 frames
+
+
+def frame_coverage(ft, link_t, want, half=None):
+    """Share of camera frames that carry >= 1 packet on EVERY link in `want`
+    within +-half seconds (None: half the median frame interval). A link with
+    no packets scores 0 and takes the total with it."""
+    ft = np.asarray(ft, dtype=np.float64)
+    if ft.size < 1 or not want:
+        return float('nan')
+    if half is None:
+        half = 0.5 * float(np.median(np.diff(ft))) if ft.size > 1 else FRAME_WINDOW_S
+    every = np.ones(ft.size, dtype=bool)
+    for lk in want:
+        t = np.sort(np.asarray(link_t.get(lk, ()), dtype=np.float64))
+        lo = np.searchsorted(t, ft - half, side='left')
+        hi = np.searchsorted(t, ft + half, side='right')
+        every &= (hi - lo) > 0
+    return float(every.mean())
 
 
 def check(path):
@@ -47,17 +74,38 @@ def check(path):
     # captures. Either way, frame k must resolve to its zero-padded JPEG name.
     fdir = os.path.join(os.path.dirname(path), f'{name}_frames')
     if os.path.isdir(fdir):
-        njpg = len(glob.glob(os.path.join(fdir, '*.jpg')))
+        njpg = len(glob.glob(os.path.join(fdir, '*.jpg'))) + \
+            len(glob.glob(os.path.join(fdir, '*.png')))
     else:
         with zipfile.ZipFile(path) as zf:
-            njpg = sum(n.startswith('frames/') and n.endswith('.jpg')
+            njpg = sum(n.startswith('frames/') and n.endswith(('.jpg', '.png'))
                        for n in zf.namelist())
     if njpg != len(ft):
-        probs.append(f'{len(ft)} frame timestamps but {njpg} jpgs on disk')
+        probs.append(f'{len(ft)} frame timestamps but {njpg} frame images on disk')
+    # The depth stream, when a take carries one: its PNGs must match its timestamps
+    # and it must run at the colour frame rate, or the depth ground truth is thin.
+    ndepth = len(d['depth_t']) if 'depth_t' in d.files else 0
+    if ndepth:
+        with zipfile.ZipFile(path) as zf:
+            npng = sum(n.startswith('depth/') and n.endswith('.png') for n in zf.namelist())
+        if npng != ndepth:
+            probs.append(f'{ndepth} depth timestamps but {npng} depth images')
+        if len(ft) > 1 and ndepth < 0.9 * len(ft):
+            probs.append(f'only {ndepth} depth frames for {len(ft)} colour frames')
+        if meta.get('dropped_depth_encode'):
+            probs.append(f'{meta["dropped_depth_encode"]} depth frames never encoded')
     if meta.get('dropped_encode'):
         probs.append(f'{meta["dropped_encode"]} frames never encoded')
+    dropped = meta.get('frames_dropped') or {}
+    if sum(dropped.values()) > 0.1 * max(meta.get('frames_recorded', len(ft)), 1):
+        probs.append(f'{sum(dropped.values())} of {meta.get("frames_recorded")} frames '
+                     f'pruned: {dropped}')
     if 'frame_seq' in d.files and len(ft) > 1:
-        gaps = int(np.sum(np.diff(d['frame_seq']) - 1))
+        # Gaps in the camera's frame counter are frames the driver dropped --
+        # minus the frames the writer pruned on purpose, which leave the same gaps.
+        gaps = int(np.sum(np.maximum(np.diff(d['frame_seq']) - 1, 0)))
+        pruned = sum((meta.get('frames_dropped') or {}).values())
+        gaps = max(gaps - pruned, 0)
         if gaps > 0.02 * len(ft):
             probs.append(f'{gaps} frames dropped by the driver ({100 * gaps / len(ft):.0f}%)')
     if len(ft) > 1 and not np.all(np.diff(ft) > 0):
@@ -120,6 +168,7 @@ def check(path):
         txs = {n.split('->')[0] for n in counts}
         pinned = next(iter(txs)) if len(txs) == 1 else None
 
+    want = set()
     if boards and pinned:
         want = {f'{pinned}->{b}' for b in boards if b != pinned}
         got = set(counts)
@@ -140,10 +189,60 @@ def check(path):
         for b in deaf:
             probs.append(f'board {b} never transmitted')
 
+    # Frame coverage: the share of camera frames that saw every expected link. A
+    # take can have every link present at a healthy average rate and still leave
+    # most frames without most links, because a link is sampled in bursts; this is
+    # the number the count-based round-robin (meta 'burst') exists to raise, so a
+    # burst-mode take that misses it is reported as the failure it is.
+    link_t = {}
+    for lk in lks:
+        tx, rx = lk.split('|')
+        link_t[f'{lab.get(tx, tx[-5:])}->{lab.get(rx, rx[-5:])}'] = d[f'{lk}|t']
+    cover = frame_coverage(ft, link_t, sorted(want)) if want else float('nan')
+    # and how many packets each link has per window: the minimum is the guarantee
+    win_min = win_med = float('nan')
+    if want and len(ft) > 1:
+        half = 0.5 * float(np.median(np.diff(ft)))
+        w = []
+        for lk in sorted(want):
+            t = np.sort(np.asarray(link_t.get(lk, ()), dtype=np.float64))
+            w.append(np.searchsorted(t, ft + half, side='right')
+                     - np.searchsorted(t, ft - half, side='left'))
+        w = np.array(w)
+        win_min, win_med = int(w.min()), float(np.median(w))
+    if meta.get('burst') and cover == cover and cover < 0.9:
+        probs.append(f'only {100 * cover:.0f}% of frames saw every link in their window (burst '
+                     f'{meta["burst"]}, token cycle {meta.get("ring_cycle_ms")} ms, '
+                     f'{meta.get("ring_timeouts", 0)} turns without TX_DONE)')
+
+    # The saved per-frame windows: present, the right shape, and consistent with
+    # the packet arrays they were cut from.
+    if 'win_iq' in d.files:
+        w = d['win_iq']
+        if w.shape[0] != len(ft):
+            probs.append(f'win_iq has {w.shape[0]} frames for {len(ft)} frame timestamps')
+        if meta.get('window_overflow'):
+            probs.append(f'{meta["window_overflow"]} packets did not fit the '
+                         f'{meta.get("window_slots")} window slots')
+        wc = d['win_count']
+        wb = [str(b) for b in d['win_boards']] if 'win_boards' in d.files else []
+        if wc.size and wb and want:
+            cells = np.zeros((len(wb), len(wb)), dtype=bool)
+            for nm in want:
+                a, b = nm.split('->')
+                if a in wb and b in wb:
+                    cells[wb.index(a), wb.index(b)] = True
+            n_empty = int(np.sum((wc == 0) & cells[None]))
+            if n_empty:
+                probs.append(f'{n_empty} frame-link windows are empty (all-zero padding)')
+    elif 'frame_t' in d.files and any(k.endswith('|iq') for k in d.files):
+        probs.append('no saved CSI windows (win_iq) in an I/Q take')
+
     if not lks:
         probs.append('no links at all')
-    return ({'name': name, 'frames': len(ft), 'dur': dur, 'fps': fps,
-             'links': len(lks), 'pkts': sum(counts.values()),
+    return ({'name': name, 'frames': len(ft), 'depth': ndepth, 'dur': dur, 'fps': fps,
+             'links': len(lks), 'pkts': sum(counts.values()), 'cover': cover,
+             'win_min': win_min, 'win_med': win_med,
              'counts': counts, 'worst_dt': worst_dt, 'mode': meta.get('mode', '?')},
             probs)
 
@@ -167,18 +266,25 @@ def main():
 
     good = [r for r in rows if 'frames' in r]
     print(f'{len(paths)} takes in {root}\n')
-    print(f'{"take":18s} {"mode":5s} {"frames":>6s} {"dur":>6s} {"fps":>6s} '
-          f'{"links":>5s} {"pkts":>6s} {"dt ms":>6s}')
+    print(f'{"take":18s} {"mode":5s} {"frames":>6s} {"depth":>5s} {"dur":>6s} {"fps":>6s} '
+          f'{"links":>5s} {"pkts":>6s} {"cov%":>5s} {"win min/med":>11s} {"dt ms":>6s}')
     for r in good:
         flag = '  <--' if any(n == r['name'] for n, _ in allprobs) else ''
-        print(f'{r["name"]:18s} {str(r["mode"])[:5]:5s} {r["frames"]:6d} {r["dur"]:6.2f} '
-              f'{r["fps"]:6.2f} {r["links"]:5d} {r["pkts"]:6d} {r["worst_dt"]:6.1f}{flag}')
+        cov = f'{100 * r["cover"]:5.1f}' if r['cover'] == r['cover'] else '    -'
+        win = (f'{r["win_min"]:5d} {r["win_med"]:5.1f}' if r['win_med'] == r['win_med']
+               else '          -')
+        print(f'{r["name"]:18s} {str(r["mode"])[:5]:5s} {r["frames"]:6d} {r["depth"]:5d} '
+              f'{r["dur"]:6.2f} {r["fps"]:6.2f} {r["links"]:5d} {r["pkts"]:6d} {cov} {win} '
+              f'{r["worst_dt"]:6.1f}{flag}')
 
     if good:
         print('\n--- consistency across takes ---')
         for key, fmt in (('frames', '%.1f'), ('dur', '%.2f'), ('fps', '%.2f'),
-                         ('pkts', '%.1f'), ('links', '%.1f')):
+                         ('pkts', '%.1f'), ('links', '%.1f'), ('cover', '%.3f')):
             v = np.array([r[key] for r in good], dtype=float)
+            v = v[np.isfinite(v)]
+            if not v.size:
+                continue
             print(f'  {key:7s} mean {fmt % v.mean():>8s}  min {fmt % v.min():>8s}  '
                   f'max {fmt % v.max():>8s}  spread {100 * v.std() / max(v.mean(), 1e-9):5.1f}%')
 
