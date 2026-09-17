@@ -34,3 +34,9 @@ __pycache__/
 # in it is built. The pieces of it we USE arrive through the component registry
 # (esp_csi_gain_ctrl in firmware/managed_components) with pinned versions.
 /esp-csi-master/
+
+# 3-D pose models: the NLF torchscript (493 MB, noncommercial research licence,
+# from github.com/isarandi/nlf/releases) and the SMPL arrays extracted from it,
+# which are not redistributable. calib/ IS tracked: one small JSON per camera.
+/models/
+/body_models/

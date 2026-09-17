@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Package the recordings + extracted skeletons into a CSI->2D-pose dataset.
+"""Package the recordings + extracted skeletons into a CSI->pose dataset.
+
+Two targets. `--target 3d` (the default since 2026-09-17) reads the depth-grounded
+SMPL fit, <take>_body.npz from fit_body.py: COCO-17 keypoints in METRES in the
+colour camera's frame (x right, y down, z forward), plus their 2-D projection.
+`--target 2d` reads the YOLO skeleton, <take>_pose.npz, in pixels, as before.
 
 Same layout and conventions as the activity dataset, so one adapter pattern covers
 both. The extra problem here is pairing: video runs at 30 fps but each CSI link is
@@ -74,8 +79,13 @@ def main():
                          'is 2*context+1 steps wide (41 by default); a loader may use '
                          'fewer by trimming the centre, never more.')
     ap.add_argument('--kp-conf', type=float, default=0.3,
-                    help='keypoint confidence below which a joint is marked invisible')
+                    help='keypoint confidence below which a joint is marked invisible (2d)')
+    ap.add_argument('--target', choices=('3d', '2d'), default='3d',
+                    help='3d: COCO-17 in metres from <take>_body.npz (fit_body.py); '
+                         '2d: COCO-17 pixels from <take>_pose.npz (extract_poses.py)')
     args = ap.parse_args()
+    three_d = args.target == '3d'
+    sidecar = '_body.npz' if three_d else '_pose.npz'
 
     import fnmatch
     pats = [x.strip() for x in args.sessions.split(',') if x.strip()]
@@ -101,12 +111,13 @@ def main():
         split = 'train' if 'train' in parts else ('test' if 'test' in parts else parts[-1])
         split_of[sess] = split
         for path in sorted(glob.glob(f'{args.src}/{sess}/*.npz')):
-            if path.endswith('_pose.npz'):
+            if any(path.endswith(x) for x in ('_pose.npz', '_nlf.npz', '_body.npz')):
                 continue
             take = os.path.basename(path)[:-4]
-            ppath = f'{args.src}/{sess}/{take}_pose.npz'
+            ppath = f'{args.src}/{sess}/{take}{sidecar}'
             if not os.path.exists(ppath):
-                sys.exit(f'missing skeletons: {ppath}. Run extract_poses.py first.')
+                sys.exit(f'missing skeletons: {ppath}. Run '
+                         f'{"extract_poses3d.py then fit_body.py" if three_d else "extract_poses.py"} first.')
 
             d = np.load(path)
             P = np.load(ppath)
@@ -133,7 +144,17 @@ def main():
 
             # pose onto the CSI grid: nearest video frame, keeping how far it was
             ft = d['frame_t'].astype(np.float64)
-            kp = P['keypoints'].astype(np.float32)          # [F, 17, 3] NaN if absent
+            if three_d:
+                # metres, camera frame; frames the fit did not close are NaN so the
+                # same validity rule (finite first joint) applies to both targets
+                kp = P['keypoints3d'].astype(np.float32).copy()
+                kp[~P['valid'].astype(bool)] = np.nan
+                kp2 = P['keypoints2d'].astype(np.float32)
+                det = np.where(P['valid'], 1.0, 0.0).astype(np.float32)
+                nper = np.ones(len(kp), np.int16)
+            else:
+                kp = P['keypoints'].astype(np.float32)      # [F, 17, 3] NaN if absent
+                kp2, det, nper = None, P['det_conf'].astype(np.float32), P['n_persons']
             F = min(len(ft), len(kp))
             ft, kp = ft[:F], kp[:F]
             j = np.clip(np.searchsorted(ft, grid), 1, max(F - 1, 1))
@@ -143,7 +164,9 @@ def main():
             pose = kp[src]                                   # [T, 17, 3]
             # A step is trainable only if a person was actually found in that frame.
             valid = np.isfinite(pose[:, 0, 0])
-            vis = (pose[:, :, 2] >= args.kp_conf) & np.isfinite(pose[:, :, 0])
+            vis = (np.isfinite(pose[:, :, 0]) if three_d
+                   else (pose[:, :, 2] >= args.kp_conf) & np.isfinite(pose[:, :, 0]))
+            extra = dict(pose2d=kp2[:F][src]) if three_d else {}
 
             activity = take.rstrip('0123456789')
             rnd = int(take[len(activity):] or 0)
@@ -154,15 +177,14 @@ def main():
                 pose=pose, pose_valid=valid, kp_visible=vis, pose_dt=dt,
                 pose_frame=src.astype(np.int32),
                 pose_full=kp, frame_t=ft.astype(np.float32),
-                det_conf=P['det_conf'].astype(np.float32)[:F],
-                n_persons=P['n_persons'][:F])
+                det_conf=det[:F], n_persons=nper[:F], **extra)
             cov.append(float(M.mean()))
             pose_ok.append(float(valid.mean()))
             gaps.append(float(dt.max()))
             rows.append(dict(clip_id=clip_id, subject=subject, session=sess, split=split,
                              activity=activity, round=rnd, n_frames=int(F),
                              pose_valid_frac=round(float(valid.mean()), 4),
-                             mean_det_conf=round(float(np.nanmean(P['det_conf'][:F])), 4),
+                             mean_det_conf=round(float(np.nanmean(det[:F])), 4),
                              mask_coverage=round(float(M.mean()), 4),
                              max_pose_dt_ms=round(float(dt.max()) * 1e3, 1),
                              frames_dir=os.path.relpath(
@@ -199,11 +221,11 @@ def main():
         acc += x.sum(0); acc2 += (x ** 2).sum(0)
         p = z['pose'][z['pose_valid']]
         if len(p):
-            pk.append(p[:, :, :2].reshape(-1, 2))
+            pk.append(p.reshape(-1, 3) if three_d else p[:, :, :2].reshape(-1, 2))
     n = len(tr) * T
     mean = acc / n
     std = np.sqrt(np.maximum(acc2 / n - mean ** 2, 1e-12))
-    pk = np.concatenate(pk) if pk else np.zeros((1, 2))
+    pk = np.concatenate(pk) if pk else np.zeros((1, 3 if three_d else 2))
     np.savez_compressed(os.path.join(args.out, 'stats.npz'),
                         csi_mean=mean.astype(np.float32), csi_std=std.astype(np.float32),
                         pose_mean=pk.mean(0).astype(np.float32),
@@ -212,23 +234,31 @@ def main():
 
     subjects = sorted({r['subject'] for r in rows})
     manifest = dict(
-        name='csi5pose', version=1,
-        description='WiFi-CSI -> 2D human pose, 4x ESP32-S3 round-robin, 12 links.',
+        name='csi5pose', version=2 if three_d else 1,
+        description=('WiFi-CSI -> 3D human pose (COCO-17, metres, camera frame), '
+                     'depth-grounded SMPL fit' if three_d else
+                     'WiFi-CSI -> 2D human pose (COCO-17 pixels)'),
         n_clips=len(rows), subjects=subjects, sessions=sessions,
         activities=acts, label_map=label_map,
         links=link_order, n_links=len(link_order), n_subcarriers=n_sub,
         clip_seconds=args.duration, grid_hz=args.rate, n_timesteps=T,
         csi_layout='[T, L, S] float32 amplitude (NO phase)',
         mask_layout='[T, L] bool, True where a real packet fell within half a grid cell',
-        pose_layout='[T, 17, 3] float32 = x, y, keypoint_confidence; pixels in a 1280x720 image',
+        pose_layout=('[T, 17, 3] float32 = x, y, z metres in the colour camera frame '
+                     '(x right, y down, z forward); NaN where no valid fit. pose2d = the '
+                     'same joints in 1280x720 pixels' if three_d else
+                     '[T, 17, 3] float32 = x, y, keypoint_confidence; pixels in a 1280x720 image'),
         context_half=args.context, context_total=2 * args.context + 1,
         context_pad='edge-replicate; samples.csv gives pad_steps per target',
         n_samples=len(samples), n_samples_padded=npad,
         sample_index='samples.csv -- one row per (clip, centre step); slice '
                      'csi[t-context : t+context+1] from the clip file',
         pose_format='COCO-17', keypoint_names=COCO17, skeleton=SKELETON,
-        image_size=[1280, 720], pose_model='yolo11x-pose (ultralytics), imgsz 960',
-        pose_is_2d=True,
+        image_size=[1280, 720],
+        pose_model=('NLF (nlf_l_multi) per frame + depth-grounded SMPL fit with temporal '
+                    'bundle adjustment (tools/fit_body.py)' if three_d else
+                    'yolo11x-pose (ultralytics), imgsz 960'),
+        pose_is_2d=not three_d,
         mean_mask_coverage=round(float(np.mean(cov)), 4),
         mean_pose_valid=round(float(np.mean(pose_ok)), 4),
         max_pose_pairing_gap_ms=round(float(np.max(gaps)) * 1e3, 1),
@@ -254,7 +284,8 @@ def main():
 
     print(f'wrote {args.out}/')
     print(f'  {len(rows)} clips · csi [T={T}, L={len(link_order)}, S={n_sub}] @ {args.rate:g} Hz')
-    print(f'  pose [T={T}, 17, 3] COCO-17 pixels · valid steps {100*np.mean(pose_ok):.2f}%')
+    print(f'  pose [T={T}, 17, 3] COCO-17 {"metres" if three_d else "pixels"} · '
+          f'valid steps {100*np.mean(pose_ok):.2f}%')
     print(f'  mask coverage {100*np.mean(cov):.1f}% · worst pose pairing gap '
           f'{1e3*np.max(gaps):.0f} ms')
     print(f'  {int(valid_sub.sum())}/{n_sub} subcarriers carry signal')

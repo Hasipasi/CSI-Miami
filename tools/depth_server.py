@@ -107,6 +107,9 @@ def serve_client(conn, src, stop):
     cam = src.cam
     header = json.dumps(dict(
         name=cam.name, w=cam.w, h=cam.h, fps=cam.fps,
+        serial=getattr(cam, 'serial', None),
+        colour_intrinsics=getattr(cam, 'colour_intrinsics', None),
+        depth_to_colour=getattr(cam, 'depth_to_colour', None),
         depth=dict(w=cam.depth_w, h=cam.depth_h, scale=cam.depth_scale,
                    intrinsics=cam.depth_intrinsics))).encode()
     try:

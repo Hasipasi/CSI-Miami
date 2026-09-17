@@ -5,8 +5,9 @@ around a room while a RealSense watches, producing time-aligned **channel state
 information + video (colour or depth)** for human activity recognition and pose
 estimation.
 
-Everything runs in one Docker container. The host needs Docker, an X server for the
-GUI, and a separate Python venv only for the pose model (which wants CUDA).
+Everything runs in Docker: one image for the firmware and the capture tools, a
+second (`Dockerfile.pose`, service `pose`) with torch for the 3-D pose side. The host
+needs Docker, an X server for the GUI, and the NVIDIA container toolkit for `pose`.
 
 ---
 
@@ -188,14 +189,16 @@ csi-rig/
 ├── firmware/          ESP-IDF project for the boards (esp32s3)
 ├── tools/             every script; flat, one job each
 ├── protocols/         YAML capture scripts (which takes, how long, how many rounds)
+├── calib/             RealSense calibration JSON per camera (tools/rs_calib.py), tracked
+├── models/            NLF torchscript + the SMPL arrays extracted from it (not tracked)
 ├── data/              raw recordings, one directory per session
 ├── dataset/           packaged datasets built from data/
 ├── archive/           superseded datasets, kept for reference
-├── Dockerfile
+├── Dockerfile         ESP-IDF + capture tools (service `csi`)
+├── Dockerfile.pose    torch/CUDA: NLF, the SMPL fit, YOLO, dataset builders (service `pose`)
 ├── docker-compose.yml
 ├── NOTES.md           lab log: findings, failures, and why things are the way they are
-├── RECORDING_2026-08-12.md   what is in data/: sessions, config, validation, caveats
-└── .venv_pose/        CUDA venv, only for the pose model (not needed to record)
+└── RECORDING_2026-08-12.md   what is in data/: sessions, config, validation, caveats
 ```
 
 The repo is bind-mounted at `/workspace` in the container, so a path is the same
@@ -240,8 +243,10 @@ firmware ──UART──▶ tools/capture.py ──▶ data/<session>/*.npz
                         │                        │
                    tools/viewer.py          tools/check_session.py   (validate)
                    (GUI + protocols)             │
-                                          tools/extract_poses.py     (skeletons)
+                                          tools/extract_poses3d.py   (NLF: RGB -> SMPL init)
                                                  │
+                                          tools/fit_body.py          (depth-grounded SMPL fit
+                                                 │                    + temporal bundle adjustment)
                         ┌────────────────────────┴───────────────┐
               tools/build_activity.py                   tools/build_pose.py
                         └────────────▶ dataset/ ◀───────────────┘
@@ -318,15 +323,58 @@ Checks link completeness, class balance, frame/JPEG agreement, monotonic clocks,
 stuck or all-zero amplitudes. Every check exists because that failure happened and
 was silent.
 
-### 3. Extract skeletons (pose task only)
+### 3. 3-D pose (pose task only)
 
 ```bash
-.venv_pose/bin/python tools/extract_poses.py --src data
+docker compose build pose                                   # once; ~5 GB image
+# put models/nlf_l_multi_0.3.2.torchscript in place (github.com/isarandi/nlf/releases)
+docker compose run --rm pose python3 tools/extract_poses3d.py --src data   # RGB -> SMPL per frame
+docker compose run --rm pose python3 tools/fit_body.py --src data          # depth-grounded fit
+docker compose run --rm pose python3 tools/body_report.py data             # summary per session
+docker compose run --rm pose python3 tools/plot_body_fit.py data/<session>/<take>.npz
 ```
 
-`yolo11x-pose` over the recorded video, ~14 fps on an RTX 4050. Writes
-`<take>_pose.npz` beside each capture. `tools/plot_pose_gt.py` renders a contact
-sheet to eyeball the targets.
+`CSI_DATA=<dir>` mounts a recordings directory elsewhere at `/workspace/data`.
+
+Two steps, on purpose. **`extract_poses3d.py`** runs NLF (Neural Localizer Fields,
+Sárándi & Pons-Moll 2024) over the colour frames: a full SMPL body per frame —
+pose, shape, and where it stands in metres — with the 2-D joints and a per-joint
+uncertainty. Writes `<take>_nlf.npz`. ~50 fps on the GPU once TorchScript has
+warmed up (the first two calls of a shape take 10–15 s, which is why batches are
+padded to one size). A monocular network is stable in *pose* but only guesses
+*distance* from apparent body size; on the first take checked it was 4 cm off and
+drifting by several cm within a 7 s take.
+
+**`fit_body.py`** then anchors that body to the RealSense depth and solves the
+take as one sequence: one shape, a pose and a translation per frame, minimising
+(all robustly) the distance from every depth point on the person to the body
+surface, the reprojection of the joints against the network's 2-D estimate, a
+prior towards the network's pose, and joint velocity and acceleration across
+frames. The depth points are the ones in the person's box, in a band around the
+initial body, then within 15 cm of the first-pass fit — floor and wall never
+enter. ~15 s per take, or ~25 s with `--elaborate` (more iterations and vertices;
+same residual, joints ~8 mm apart on average and up to ~18 mm at the knees and
+ankles — use it for a dataset, the fast default for checking a take). Writes
+`<take>_body.npz`: SMPL parameters, the 24 SMPL
+joints and **`keypoints3d [F, 17, 3]` — COCO-17 in metres in the colour camera's
+frame** (x right, y down, z forward), the training target, with `valid` per
+frame and per-frame residuals (`depth_med`, `reproj_px`). Point-to-body residuals
+of ~35 mm median are the sensor: a plane fitted to a flat patch of the same
+scene at 3 m has 15–17 mm median residual, and the point-to-vertex distance adds
+the vertex spacing on top.
+
+The camera geometry the fit needs — colour intrinsics and the depth→colour
+extrinsics — is written into meta by the recorder since 2026-09-17. Older takes
+(everything up to and including the 2026-09-17 sessions) have only the depth
+intrinsics; run `tools/rs_calib.py` once on the rig with the camera plugged in
+and commit `calib/realsense_<serial>.json`, which the tools pick up by the
+serial in meta. Until then they fall back to nominal D435i values and say so
+loudly. Measured on one take, the fallback costs nothing visible (the residual
+does not move when the extrinsic offset is flipped or zeroed), but nominal is
+nominal.
+
+The 2-D route is still there: `tools/extract_poses.py` (YOLO11x-pose,
+`<take>_pose.npz`, pixels) and `build_pose.py --target 2d`.
 
 ### 4. Build datasets
 
@@ -338,6 +386,10 @@ python3 tools/build_activity.py --src data --sessions '*_train,*_test' \
 python3 tools/build_pose.py     --src data --sessions '*_train,*_test' \
         --rate 30 --context 20 --subcarriers $SUB --out dataset/csi5pose_rr_v3
 ```
+
+`build_pose.py` takes the 3-D target (`--target 3d`, the default: `pose [T, 17, 3]`
+in metres from `<take>_body.npz`, with `pose2d` beside it) or the old 2-D one
+(`--target 2d`, pixels from `<take>_pose.npz`).
 
 Round-robin and single-TX captures have different link counts and cannot share a
 dataset, so `--sessions` selects them separately (`'*_train,*_test'` vs `'*_txB'`).
@@ -362,6 +414,12 @@ grid can be built without re-recording.
 ones at R² = 0.973, which is why the datasets ship 30, and why the firmware now sends
 only those 30. Picking the *highest-variance* 30 instead scores 0.831 — they cluster
 and re-measure the same thing.
+
+**3-D pose targets are in the colour camera's frame, not the room's.** The camera
+does not move within a session, so this is a rigid room frame up to one unknown
+transform; but nothing has been measured between the camera and the boards yet,
+so a link's geometry cannot be related to a joint position without that. The
+frame is x right, y down, z forward, metres.
 
 **The dataset builders do not read phase yet.** `build_activity.py` and
 `build_pose.py` consume the `a` (magnitude) arrays. Captures made with v2 firmware

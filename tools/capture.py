@@ -497,6 +497,12 @@ class RealSenseCamera:
         i = ds.get_intrinsics()
         self.depth_intrinsics = dict(fx=i.fx, fy=i.fy, ppx=i.ppx, ppy=i.ppy,
                                      model=str(i.model), coeffs=list(i.coeffs))
+        # The 3-D pose fit projects the body with the COLOUR intrinsics and moves
+        # depth points into the colour frame with these extrinsics; recorded in
+        # meta so a take is self-describing (takes before 2026-09-17 need
+        # calib/realsense_<serial>.json from tools/rs_calib.py instead).
+        self.serial = serial
+        self.colour_intrinsics, self.depth_to_colour = rs_colour_geometry(cs, ds)
         self.monotonic = False
         self.wall_ts = True
         self.has_depth = True
@@ -558,6 +564,17 @@ class RealSenseCamera:
 DEPTH_SOCKET = '/tmp/csi-depth.sock'
 
 
+def rs_colour_geometry(cs, ds):
+    """(colour intrinsics dict, depth->colour extrinsics dict) for two librealsense
+    video stream profiles, in the layout body_common.load_calib reads."""
+    i = cs.get_intrinsics()
+    intr = dict(width=cs.width(), height=cs.height(), fx=i.fx, fy=i.fy, ppx=i.ppx,
+                ppy=i.ppy, model=str(i.model), coeffs=list(i.coeffs))
+    ex = ds.get_extrinsics_to(cs)
+    return intr, dict(rotation=[float(r) for r in ex.rotation],
+                      translation=[float(t) for t in ex.translation])
+
+
 def colourise_depth(d, scale, max_m=4.0):
     """A depth frame as 8-bit RGB: near is red, far is blue, no return is black.
     For looking at, not for measuring; the uint16 frame is what gets recorded."""
@@ -593,6 +610,9 @@ class ServedCamera:
         self.depth_w, self.depth_h = int(d['w']), int(d['h'])
         self.depth_scale = float(d['scale'])
         self.depth_intrinsics = d['intrinsics']
+        self.colour_intrinsics = hdr.get('colour_intrinsics')
+        self.depth_to_colour = hdr.get('depth_to_colour')
+        self.serial = hdr.get('serial')
         self.name = f"{hdr['name']} via depth_server"
         self.monotonic = False
         self.wall_ts = True
@@ -765,6 +785,11 @@ def camera_gt_meta(cam, gt):
     if getattr(cam, 'has_depth', False):
         out.update(depth_scale_m=cam.depth_scale, depth_width=cam.depth_w,
                    depth_height=cam.depth_h, depth_intrinsics=cam.depth_intrinsics)
+        for k in ('colour_intrinsics', 'depth_to_colour'):
+            if getattr(cam, k, None):
+                out[k] = getattr(cam, k)
+    if getattr(cam, 'serial', None):
+        out['camera_serial'] = cam.serial
     if gt == 'depth':
         out.update(frame_dtype='uint16', frame_unit='depth units, x depth_scale_m = metres')
     return out

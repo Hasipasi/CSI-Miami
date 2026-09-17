@@ -24,3 +24,26 @@ services:
       - DISPLAY=${DISPLAY}
     stdin_open: true
     tty: true
+
+  # GPU side: NLF + SMPL fit + YOLO + dataset builders (Dockerfile.pose). The
+  # recordings mount at /workspace/data from $CSI_DATA (default ./data), so
+  # `CSI_DATA=~/Downloads docker compose run --rm pose ...` works off a copy.
+  pose:
+    build:
+      context: .
+      dockerfile: Dockerfile.pose
+    image: csi-pose:latest
+    working_dir: /workspace
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/workspace
+      - ${CSI_DATA:-./data}:/workspace/data
+    # `runtime: nvidia` is the passthrough that works with nvidia-container-toolkit
+    # as configured in /etc/docker/daemon.json; the CDI / `gpus:` route left CUDA
+    # with "unknown error" on the 2026-09-17 workstation.
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    stdin_open: true
+    tty: true

@@ -1,0 +1,21 @@
+# GPU image for the pose side of the pipeline: NLF (RGB -> SMPL), the
+# depth-grounded SMPL fit, YOLO pose, and the dataset builders. Separate from the
+# ESP-IDF image because torch + CUDA is ~5 GB that the firmware and capture tools
+# never need. The CUDA runtime ships inside the torch wheels; the host needs only
+# the NVIDIA driver and nvidia-container-toolkit (`docker info` lists a `nvidia`
+# runtime when it is set up).
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 libgomp1 gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    torch torchvision \
+    numpy scipy pillow opencv-python-headless matplotlib pyyaml \
+    ultralytics
+
+# Config/cache dirs that work for a non-root `user:` in docker-compose.
+ENV HOME=/tmp MPLCONFIGDIR=/tmp/mpl YOLO_CONFIG_DIR=/tmp/yolo TRITON_CACHE_DIR=/tmp/triton \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/inductor TORCH_HOME=/workspace/models/torch PYTHONUNBUFFERED=1
+WORKDIR /workspace

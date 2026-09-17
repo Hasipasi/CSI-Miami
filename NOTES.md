@@ -1303,3 +1303,75 @@ write fails is kept as `<take>_raw.pkl` and `rewrite_raw.py` writes it later
 (this saved two takes that hit an AppleDouble `._` file in their frame folder);
 pinned mode gets 48 window slots and its own pruning rule (only the pinned
 transmitter's links must be present); meta is JSON-safe against NumPy scalars.
+
+## 2026-09-17 — 3-D pose: NLF + depth-grounded SMPL fit, temporal bundle adjustment
+
+The 2-D-skeleton-plus-depth-at-the-joint route was replaced. A depth pixel at a
+joint is the body *surface* (biased towards the camera by half a limb), it is
+missing wherever the joint is occluded or on an edge, and the result jumped by
+centimetres frame to frame. New route, all in Docker (`Dockerfile.pose`, service
+`pose`, `runtime: nvidia`; the CDI / `gpus:` passthrough gave "CUDA unknown error"
+on this workstation while `--runtime nvidia` worked):
+
+1. `tools/extract_poses3d.py`: NLF (`nlf_l_multi_0.3.2.torchscript`, 493 MB,
+   noncommercial research licence) on every colour frame → SMPL pose (72), betas
+   (10), translation in metres, 24 joints in 3-D and 2-D, per-joint uncertainty in
+   mm, box. `<take>_nlf.npz`. `detect_smpl_batched(images [B,3,H,W] uint8,
+   intrinsic_matrix)`; boxes are **x, y, w, h, score** (cost one empty-point-cloud
+   run to learn). Steady state 8 frames / 0.16 s = ~50 fps on the 4070 Ti SUPER;
+   the first two calls per input shape are TorchScript profiling runs at 10–15 s
+   each, so the last batch of a take is padded to the fixed batch size instead
+   of shrunk. `torch.jit.load` warns it is unsupported on Python 3.14, so the
+   image is python:3.12. The detector needs `import torchvision` before the load
+   (registers `torchvision::nms`), Triton needs gcc and a writable cache dir
+   inside the container.
+2. `tools/body_common.py`: a hand-written SMPL LBS layer fed from
+   `models/smpl_neutral.npz`, which `extract_poses3d.py` extracts once from the
+   body model inside the NLF torchscript (no SMPL registration needed).
+   `--check-smpl` compares it against NLF's own forward: 0.001 mm after fixing
+   one convention — smplfitter drives the pose blend shapes with vec(R), not
+   vec(R − I), and its template has the identity's contribution subtracted
+   (74.8 mm of constant vertex offset until the template was corrected back).
+3. `tools/fit_body.py`: per take, one betas + per-frame pose and translation,
+   Adam, robust (Geman-McClure) terms: depth points → nearest body vertex
+   (one-directional; the depth sees only the front), 24 joints reprojected against
+   NLF's direct 2-D estimate weighted by its uncertainty, pose prior to NLF, joint
+   velocity + acceleration scaled by the real frame spacing, pose velocity, betas
+   prior. Distance is first read off the depth (torso pixels vs the initial body's
+   front surface), then translation only, then everything, with the point set
+   cut to 15 cm from the first-pass body. ~25 s per 207-frame take. Output
+   `<take>_body.npz` with `keypoints3d [F, 17, 3]` (COCO-17, metres, colour camera
+   frame) as the target, `valid`, residuals, and `trans_nlf` for comparison.
+
+Measured on `260917_RR_gergo/arms_forward0` (207 frames, person at 2.9 m):
+
+* NLF found the person in every frame. Its RGB-only distance was **4.4 cm too
+  far** (median) and moved by ±3 cm within the take while the person stood still.
+* After the fit: point-to-body median **35 mm**, reprojection 2.2 px, no bias
+  (mean signed offset between points and their nearest vertex: x −1.4, y +2.0,
+  z −0.0 mm; 52% of points in front of their vertex). The sensor's own noise on
+  the same frames: a plane through the floor patch at ~3 m leaves 15.1 mm median
+  / 24 mm rms residual, a plane through a 10 cm chest patch 17.5 mm / 22 mm. So
+  ~35 mm is noise plus the point-to-*vertex* discretisation (a third of the
+  vertices, ~2 cm apart), not misalignment.
+* The colour intrinsics and depth→colour extrinsics are not in any meta before
+  today; nominal D435i values are used (fx = fy = 915, offset 14.8 mm). Flipping
+  the offset's sign or zeroing it changes the residual by < 1 mm, so at 3 m it is
+  immaterial; `tools/rs_calib.py` writes the real ones to
+  `calib/realsense_<serial>.json` and the recorder now stores them in meta
+  (`colour_intrinsics`, `depth_to_colour`, `camera_serial`). The camera in the
+  2026-09-17 sessions is serial 036522070077 (not the 039223051974 unit of the
+  August notes).
+* `chunk` 24 → 52 saved 5 s of 28; the rest is Python per-iteration overhead.
+  Stage-2 loss plateaus by iteration ~60–80. Two settings: the default fast one
+  (20 + 50 iterations, 1200 vertices, ~15 s a take) and `--elaborate` (30 + 80,
+  2300, ~25 s). On joe/arms_forward0 they agree to 8 mm mean per joint (p95 20 mm,
+  max 33 mm; the legs differ most, 15–18 mm at knees and ankles, the torso and
+  head 4–8 mm) with the same point-to-body residual (31.8 vs 30.9 mm), betas
+  within 0.05, and z within 6 mm. The residual is now always measured against
+  the same 2300 vertices, whatever `--vertices` fitted with, so the numbers
+  compare. The whole 2026-09-17 corpus is being fitted with `--elaborate`.
+
+Open: the whole 2026-09-17 corpus (22 sessions, 1248 takes) is being run; see the
+batch summary appended below. `build_pose.py --target 3d` packages
+`keypoints3d`. Nothing relates the camera frame to the board positions yet.
