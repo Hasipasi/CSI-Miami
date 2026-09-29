@@ -202,6 +202,10 @@ def main():
                 pred = detect(model, imgs, K, args)
                 for b in range(len(members)):
                     i = s + b
+                    # No detection at all leaves 'boxes' out of the result, it is
+                    # not an empty tensor: an empty frame would otherwise raise.
+                    if 'boxes' not in pred:
+                        continue
                     bx = pred['boxes'][b].cpu().numpy()
                     if len(bx) == 0:
                         continue
@@ -214,12 +218,15 @@ def main():
                     pose[i] = pred['pose'][b][k].cpu().numpy()
                     betas[i] = pred['betas'][b][k].cpu().numpy()[:10]
                     trans[i] = pred['trans'][b][k].cpu().numpy()
-                    j3[i] = pred['joints3d'][b][k].cpu().numpy()[:24]
-                    j3n[i] = pred['joints3d_nonparam'][b][k].cpu().numpy()[:24]
+                    # NLF's joints and uncertainties come back in millimetres
+                    # while `trans` is in metres. Stored in metres, as meta says
+                    # and as everything downstream of here assumes.
+                    j3[i] = 1e-3 * pred['joints3d'][b][k].cpu().numpy()[:24]
+                    j3n[i] = 1e-3 * pred['joints3d_nonparam'][b][k].cpu().numpy()[:24]
                     # the network's direct 2-D estimate is the observation the fit
                     # reprojects against; the parametric one is derivable from pose
                     j2[i] = pred['joints2d_nonparam'][b][k].cpu().numpy()[:24]
-                    unc[i] = pred['joint_uncertainties'][b][k].cpu().numpy()[:24]
+                    unc[i] = 1e-3 * pred['joint_uncertainties'][b][k].cpu().numpy()[:24]
         found = np.isfinite(trans[:, 0])
         nlf_meta = dict(
             model=os.path.basename(args.model), layout='SMPL-24 joints, axis-angle pose',

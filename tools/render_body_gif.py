@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Animate a fitted take: the colour frame with the fitted skeleton, and the metric
-3-D keypoints seen from the front, the side and above, as one GIF.
+3-D keypoints in the room frame, seen from the front, the side and above.
 
 The three orthographic views are what a CSI model is asked to predict, so this is
-the honest picture of the target: the front view should look like the camera
-frame, the side view shows the depth ordering the RGB network could only guess,
-and the top view shows where the person stands in the room relative to the
-camera (at the origin, looking along +z).
+the honest picture of the target. Coordinates are the room frame from
+body_common (origin on the floor at the centre of the board square, 2.12 m in
+front of the camera), and the rig is drawn into every view: the four antennas on
+their rods at 1.20 m, the camera 20 cm below the one it shares with board A. The
+front view should look like the camera picture, the side view shows the depth
+ordering an RGB network could only guess, and the top view shows where in the
+array the person actually stands -- which is the geometry the CSI sees.
 
-  python3 tools/render_body_gif.py data/<session>/<take>.npz [-o take.gif] [--step 2] [--fps 15]
+  python3 tools/render_body_gif.py data/<session>/<take>.npz [-o take.gif] [--step 2]
+  ... [--pitch 3]      # if the fitted feet do not sit on the floor line
+
+The camera's tilt is not measured anywhere, so --pitch (degrees, positive = nose
+down) is the one knob that moves the whole skeleton against the rig.
 """
 
 import argparse
@@ -25,10 +32,12 @@ import numpy as np                       # noqa: E402
 from PIL import Image                    # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from body_common import COCO_SKELETON, frame_members, read_jpeg   # noqa: E402
+from body_common import (BOARD_H, BOARDS, CAM_H, CAMERA_XZ, COCO_SKELETON,  # noqa: E402
+                         HALF_DIAG, frame_members, read_jpeg, to_room)
 
 LIMB_COLOR = ['#ffb02e'] * 4 + ['#f062c0'] * 4 + ['#3aa6ff'] * 4 + ['#42d97a'] * 4
 BG = '#101014'
+ROD, NODE, CAM, FLOOR = '#3f4450', '#7dd3fc', '#e8710a', '#4a4a57'
 
 
 def draw_skeleton(ax, pts, lw=2.2, ms=14):
@@ -40,11 +49,46 @@ def draw_skeleton(ax, pts, lw=2.2, ms=14):
     ax.scatter(pts[ok, 0], pts[ok, 1], s=ms, c='white', edgecolors=BG, lw=0.6, zorder=3)
 
 
-def render(capture, body_path=None, out=None, step=2, fps=15, max_frames=None):
+def draw_rig(ax, view):
+    """The rods, the antennas and the camera, behind the skeleton (zorder 0)."""
+    if view == 'top':
+        ring = [BOARDS[k] for k in 'ABCD']
+        xs, zs = zip(*(ring + ring[:1]))
+        ax.plot(xs, zs, color=ROD, lw=1.4, ls='--', zorder=0)
+        for k, (x, z) in BOARDS.items():
+            ax.scatter([x], [z], s=70, c=NODE, edgecolors=BG, lw=0.8, zorder=2)
+            ax.annotate(k, (x, z), textcoords='offset points', xytext=(7, 5),
+                        color=NODE, fontsize=9, fontweight='bold')
+        cx, cz = CAMERA_XZ
+        # the camera looks along the A->C diagonal, i.e. up the page
+        ax.plot([cx - 0.22, cx, cx + 0.22], [cz - 0.02, cz + 0.3, cz - 0.02],
+                color=CAM, lw=1.6, zorder=2)
+        ax.scatter([0], [0], marker='+', s=90, c=FLOOR, lw=1.2, zorder=1)
+        return
+    # front looks along Z (rods stand at their x), side looks along X (at their z)
+    axis = 0 if view == 'front' else 1
+    lo, hi = ax.get_xlim()
+    ax.axhline(0.0, color=FLOOR, lw=1.2, zorder=0)
+    for k, xz in BOARDS.items():
+        u = xz[axis]
+        if not lo < u < hi:
+            continue
+        ax.plot([u, u], [0, BOARD_H], color=ROD, lw=2.0, zorder=0)
+        ax.scatter([u], [BOARD_H], s=60, c=NODE, edgecolors=BG, lw=0.8, zorder=1)
+        ax.annotate(k, (u, BOARD_H), textcoords='offset points', xytext=(6, 2),
+                    color=NODE, fontsize=9, fontweight='bold')
+    u = CAMERA_XZ[axis]
+    if lo < u < hi:
+        ax.scatter([u], [CAM_H], s=55, marker='s', c=CAM, edgecolors=BG, lw=0.8, zorder=1)
+
+
+def render(capture, body_path=None, out=None, step=2, fps=15, max_frames=None,
+           pitch=0.0, cam_height=CAM_H, centre_dist=HALF_DIAG):
     body_path = body_path or capture[:-4] + '_body.npz'
     out = out or capture[:-4] + '_body.gif'
     B = np.load(body_path)
-    K3, K2 = B['keypoints3d'], B['keypoints2d']
+    K3 = to_room(B['keypoints3d'], pitch, cam_height, centre_dist)
+    K2 = B['keypoints2d']
     valid = B['valid'].astype(bool)
     F = len(K3)
     rows = list(range(0, F, step))
@@ -53,10 +97,9 @@ def render(capture, body_path=None, out=None, step=2, fps=15, max_frames=None):
     # fixed axes over the whole take so the person does not swim as the limits move
     P = K3[valid].reshape(-1, 3)
     cx, cz = np.median(P[:, 0]), np.median(P[:, 2])
-    r = 1.15                                  # half-width of every 3-D view, metres
-    y_lo, y_hi = np.nanmin(P[:, 1]) - 0.15, np.nanmax(P[:, 1]) + 0.15
-    y_mid = 0.5 * (y_lo + y_hi)
-    half_y = max(r, 0.5 * (y_hi - y_lo))
+    r = 1.15                                  # half-width of the front/side views, m
+    y_hi = max(np.nanmax(P[:, 1]) + 0.2, BOARD_H + 0.35)
+    arena = HALF_DIAG + 0.5                   # the top view holds the whole square
 
     with np.load(capture) as d, zipfile.ZipFile(capture) as zf:
         meta = json.loads(str(d['meta'])) if 'meta' in d.files else {}
@@ -80,31 +123,36 @@ def render(capture, body_path=None, out=None, step=2, fps=15, max_frames=None):
                            + ('' if valid[i] else ' · NOT VALID'),
                            color='white', fontsize=10)
             p = K3[i] if valid[i] else np.full((17, 3), np.nan)
-            # front: x right, y down (image-like), seen from the camera
-            draw_skeleton(ax_f, p[:, [0, 1]])
+            # front: X right, Y up, floor at 0 -- the camera's own view of the arena
             ax_f.set_xlim(cx - r, cx + r)
-            ax_f.set_ylim(y_mid + half_y, y_mid - half_y)
-            ax_f.set_title('front (x, y)', color='white', fontsize=10)
-            # side: z (distance from camera) right, y down; camera is to the left
-            draw_skeleton(ax_s, p[:, [2, 1]])
+            ax_f.set_ylim(-0.1, y_hi)
+            draw_rig(ax_f, 'front')
+            draw_skeleton(ax_f, p[:, [0, 1]])
+            ax_f.set_title('front (X, Y)', color='white', fontsize=10)
+            # side: Z away from the camera, Y up; the camera stands at Z = -2.12
             ax_s.set_xlim(cz - r, cz + r)
-            ax_s.set_ylim(y_mid + half_y, y_mid - half_y)
-            ax_s.set_title('side (z, y) · camera at left', color='white', fontsize=10)
-            # top: x right, z up (away from the camera at the bottom)
-            draw_skeleton(ax_t, p[:, [0, 2]])
-            ax_t.set_xlim(cx - r, cx + r)
-            ax_t.set_ylim(cz - r, cz + r)
-            ax_t.set_title('top (x, z) · camera below', color='white', fontsize=10)
+            ax_s.set_ylim(-0.1, y_hi)
+            draw_rig(ax_s, 'side')
+            draw_skeleton(ax_s, p[:, [2, 1]])
+            ax_s.set_title('side (Z, Y)', color='white', fontsize=10)
+            # top: the whole 3 m square, camera at the near corner looking up the page
+            ax_t.set_xlim(-arena, arena)
+            ax_t.set_ylim(-arena, arena)
+            draw_rig(ax_t, 'top')
+            draw_skeleton(ax_t, p[:, [0, 2]], lw=1.6, ms=8)
+            ax_t.set_title('top (X, Z) · whole array', color='white', fontsize=10)
             for ax in (ax_f, ax_s, ax_t):
                 ax.set_aspect('equal')
                 ax.tick_params(colors='#9a9aa5', labelsize=7)
                 for sp in ax.spines.values():
                     sp.set_color('#3a3a44')
                 ax.grid(color='#2a2a33', lw=0.6)
-                ax.set_xlabel('m', color='#9a9aa5', fontsize=8)
+                ax.set_xlabel('m from the arena centre', color='#9a9aa5', fontsize=8)
             ax_c.set_axis_off()
+            foot = np.nanmin(K3[i, :, 1]) if valid[i] else np.nan
             fig.suptitle(f'{os.path.basename(capture)} — depth-grounded SMPL fit, COCO-17 in '
-                         f'metres (z = {np.nanmedian(K3[i, :, 2]):.2f} m from the camera)',
+                         f'metres, room frame (origin on the floor at the array centre; '
+                         f'lowest joint {foot:+.2f} m)',
                          color='white', fontsize=11, fontweight='bold')
             buf = io.BytesIO()
             fig.savefig(buf, format='png', dpi=72, facecolor=BG)
@@ -128,8 +176,14 @@ def main():
     ap.add_argument('--step', type=int, default=2, help='use every Nth frame')
     ap.add_argument('--fps', type=float, default=15.0)
     ap.add_argument('--max-frames', type=int, default=None)
+    ap.add_argument('--pitch', type=float, default=0.0,
+                    help='camera tilt, degrees nose down (default: %(default)s)')
+    ap.add_argument('--cam-height', type=float, default=CAM_H)
+    ap.add_argument('--centre-dist', type=float, default=HALF_DIAG,
+                    help='camera to arena centre, m (default: %(default).2f)')
     args = ap.parse_args()
-    render(args.capture, args.body, args.output, args.step, args.fps, args.max_frames)
+    render(args.capture, args.body, args.output, args.step, args.fps, args.max_frames,
+           args.pitch, args.cam_height, args.centre_dist)
 
 
 if __name__ == '__main__':

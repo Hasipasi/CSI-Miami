@@ -57,6 +57,56 @@ COCO_FROM_SMPL = {0: ('v', 332), 1: ('v', 2800), 2: ('v', 6260), 3: ('v', 583),
 # fit starts: the body parts a depth camera sees best and that move least.
 TORSO_JOINTS = [0, 3, 6, 9, 12, 16, 17, 1, 2]
 
+# -------------------------------------------------------------------- room frame
+
+# The rig, in metres. Origin on the floor at the centre of the board square, X to
+# the camera's right, Y up, Z away from the camera. The camera sits on board A's
+# rod and looks along the A->C diagonal, so the centre of a 3 m square is half a
+# diagonal away -- 2.12 m, which is the ~2.1 m paced out on the floor. Antennas
+# ride the rods at 1.20 m, the camera 20 cm below the one it shares with A.
+ROOM_SIDE = 3.0
+HALF_DIAG = ROOM_SIDE * np.sqrt(2) / 2          # 2.121 m: camera to arena centre
+BOARD_H, CAM_H = 1.20, 1.00
+# (x, z) on the floor. Seen from the camera at A: C straight ahead, B left, D right
+# (README setup 3 -- far row C D, near row B A).
+BOARDS = {'A': (0.0, -HALF_DIAG), 'B': (-HALF_DIAG, 0.0),
+          'C': (0.0, HALF_DIAG), 'D': (HALF_DIAG, 0.0)}
+CAMERA_XZ = BOARDS['A']
+
+
+def room_from_camera(pitch_deg=0.0, cam_height=CAM_H, centre_dist=HALF_DIAG):
+    """(R, t) taking colour-camera points (x right, y down, z forward) to the room
+    frame: X = R @ P + t.
+
+    Nothing measures the camera's tilt, so pitch is a knob rather than a constant:
+    a couple of degrees of downward tilt moves the far corner of the arena by ~10 cm
+    and is the first thing to try when the fitted feet do not sit near Y = 0.
+    """
+    c, s = np.cos(np.radians(pitch_deg)), np.sin(np.radians(pitch_deg))
+    # camera x -> X; camera "down" -> (0, -c, -s); camera "forward" -> (0, -s, c)
+    R = np.array([[1.0, 0.0, 0.0], [0.0, -c, -s], [0.0, -s, c]])
+    return R, np.array([0.0, cam_height, -centre_dist])
+
+
+def to_room(P, pitch_deg=0.0, cam_height=CAM_H, centre_dist=HALF_DIAG):
+    """Camera-frame points [..., 3] -> room frame, NaNs surviving as NaNs."""
+    R, t = room_from_camera(pitch_deg, cam_height, centre_dist)
+    return np.asarray(P, float) @ R.T + t
+
+
+def _demo():
+    a = to_room(np.array([[0.0, 0.0, 0.0], [0.0, CAM_H, HALF_DIAG]]))
+    assert np.allclose(a[0], [0, CAM_H, -HALF_DIAG]), a[0]      # the camera itself
+    assert np.allclose(a[1], [0, 0, 0]), a[1]                   # floor, arena centre
+    # a downward tilt puts a point on the optical axis lower and nearer, and a
+    # 3 m square really does have a 2.12 m half-diagonal
+    p = to_room(np.array([0.0, 0.0, 2.0]), pitch_deg=10.0)
+    assert p[1] < CAM_H and p[2] < 2.0 - HALF_DIAG, p
+    assert abs(np.hypot(*BOARDS['A']) - HALF_DIAG) < 1e-9
+    assert abs(np.hypot(*(np.array(BOARDS['A']) - BOARDS['B'])) - ROOM_SIDE) < 1e-9
+    print('room frame OK')
+
+
 # ------------------------------------------------------------------ calibration
 
 # Nominal D435i geometry for takes recorded before the calibration was stored in
@@ -441,3 +491,7 @@ def lerp_rotvec(a, b, w):
         s = Slerp([0.0, 1.0], Rot.from_rotvec(np.stack([a2[i], b2[i]])))
         out[i] = s([w]).as_rotvec()[0]
     return out.reshape(shp)
+
+
+if __name__ == '__main__':
+    _demo()

@@ -1,0 +1,62 @@
+{
+  // Thin wrappers over .vscode/run.sh -- the docker commands live there, one flag
+  // per line. Anything new goes into that script, not into a longer string here.
+  "version": "2.0.0",
+  "options": { "cwd": "${workspaceFolder}" },
+  "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+  "tasks": [
+    {
+      "label": "GUI: CSI + camera",
+      "type": "shell",
+      "detail": "viewer.py — waterfalls, camera, depth, REC, protocols (raw takes)",
+      "command": ".vscode/run.sh viewer",
+      "problemMatcher": []
+    },
+    {
+      "label": "GUI: camera + depth only",
+      "type": "shell",
+      "detail": "camera_view.py — no boards needed, for placing the camera (G = grid)",
+      "command": ".vscode/run.sh camera",
+      "problemMatcher": []
+    },
+    {
+      "label": "GUI: live 3-D pose (NLF)",
+      "type": "shell",
+      "detail": "live_body.py — live skeleton + top-down, REC a 10 s segment, fit, looping 3-D result",
+      "command": ".vscode/run.sh pose",
+      "problemMatcher": []
+    },
+    {
+      "label": "Record: headless take",
+      "type": "shell",
+      "detail": "capture.py — round-robin by default; stop the GUI first (one owner of the ports)",
+      "command": ".vscode/run.sh record ${input:seconds} ${input:prefix}",
+      "problemMatcher": []
+    },
+    {
+      "label": "Check a session",
+      "type": "shell",
+      "detail": "check_session.py — run on every session before trusting it",
+      "command": ".vscode/run.sh check ${input:session}",
+      "problemMatcher": []
+    },
+    {
+      "label": "Finish raw takes (add CSI windows)",
+      "type": "shell",
+      "detail": "finish_capture.py — the postprocessing step raw recording skips",
+      "command": ".vscode/run.sh finish ${input:session}",
+      "problemMatcher": []
+    },
+    {
+      "label": "Firmware: build",
+      "type": "shell",
+      "command": ".vscode/run.sh firmware",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    { "id": "seconds", "type": "promptString", "description": "seconds to record", "default": "60" },
+    { "id": "prefix", "type": "promptString", "description": "capture prefix under data/", "default": "test/take" },
+    { "id": "session", "type": "promptString", "description": "session dir under data/", "default": "test" }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  // The tools run in the container, so these entries just call .vscode/run.sh,
+  // which holds the docker commands laid out one flag per line. node-terminal is
+  // VS Code's "just run this" debug type: it needs no Node in the container, it
+  // only owns the terminal. The same targets are in tasks.json for Run Task.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "GUI: CSI + camera",
+      "type": "node-terminal",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "command": ".vscode/run.sh viewer"
+    },
+    {
+      "name": "GUI: camera + depth only",
+      "type": "node-terminal",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "command": ".vscode/run.sh camera"
+    },
+    {
+      "name": "GUI: live 3-D pose (NLF)",
+      "type": "node-terminal",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "command": ".vscode/run.sh pose"
+    }
+  ]
+}

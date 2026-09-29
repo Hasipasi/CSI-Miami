@@ -228,6 +228,16 @@ docker compose run --rm -e QT_X11_NO_MITSHM=1 --name csi_live csi \
 ```
 
 Captures go to `$CSI_DATA` if set, else `<flash drive>/data` on a Mac with a stick
+
+**`--raw` records and nothing else.** A raw take holds the packets per link, the
+colour frames and the depth frames -- everything measured -- and skips the
+per-frame CSI windows, which are computed from exactly that and take seconds per
+take that an operator stands and waits for. `tools/finish_capture.py` adds them
+later on whatever machine the data ends up on, feeding the packets back through
+the same `write_capture`; a finished take is identical to one the recorder would
+have written on the spot (verified by round-trip on a 2026-09-17 take: every
+window, packet and timestamp equal). Raw takes carry `meta['raw']`, are ~15%
+smaller, and `check_session.py` does not ask them for windows.
 plugged in (the viewer prints where at startup), else `/workspace/data` in the
 container, else `<repo>/data`.
 
@@ -415,11 +425,16 @@ ones at R² = 0.973, which is why the datasets ship 30, and why the firmware now
 only those 30. Picking the *highest-variance* 30 instead scores 0.831 — they cluster
 and re-measure the same thing.
 
-**3-D pose targets are in the colour camera's frame, not the room's.** The camera
-does not move within a session, so this is a rigid room frame up to one unknown
-transform; but nothing has been measured between the camera and the boards yet,
-so a link's geometry cannot be related to a joint position without that. The
-frame is x right, y down, z forward, metres.
+**3-D pose targets are stored in the colour camera's frame** (x right, y down,
+z forward, metres), and `body_common.room_from_camera()` is the transform into the
+**room frame** used by the viewers: origin on the floor at the centre of the board
+square, X right, Y up, Z away from the camera. It follows from the setup rather
+than from a measurement — the camera rides board A's rod at 1.00 m with the
+antennas at 1.20 m, looking along the A→C diagonal, so the arena centre is half a
+diagonal (2.12 m) ahead. The camera's tilt is not measured at all: `--pitch`
+(degrees nose down) is the knob, and the fitted feet landing near Y = 0 is the
+check. `render_body_gif.py` draws the rods, the antennas and the camera into every
+view so a take can be read against the array; the stored targets are unchanged.
 
 **The dataset builders do not read phase yet.** `build_activity.py` and
 `build_pose.py` consume the `a` (magnitude) arrays. Captures made with v2 firmware

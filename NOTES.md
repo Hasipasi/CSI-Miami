@@ -1375,3 +1375,42 @@ Measured on `260917_RR_gergo/arms_forward0` (207 frames, person at 2.9 m):
 Open: the whole 2026-09-17 corpus (22 sessions, 1248 takes) is being run; see the
 batch summary appended below. `build_pose.py --target 3d` packages
 `keypoints3d`. Nothing relates the camera frame to the board positions yet.
+
+## 2026-09-29 — room frame, and the rig drawn into the 3-D views
+
+The 3-D targets were camera-frame only, which makes a joint position impossible to
+read against the array. `body_common` now carries the arena geometry and
+`room_from_camera()`/`to_room()`: origin on the floor at the centre of the board
+square, X right, Y up, Z away from the camera; antennas at 1.20 m on the rods,
+camera at 1.00 m on board A's rod. The camera looks along the A→C diagonal, so
+the centre of the 3 m square is 2.121 m ahead — the ~2.1 m paced out on the floor.
+
+This is asserted from the setup, not measured: the camera is taken to sit exactly
+at corner A, level, looking down the diagonal. Tilt is the term that matters
+(a degree moves the far corner ~4 cm) and it is exposed as `--pitch` on
+`render_body_gif.py` and `live_body.py` rather than assumed away. The check is the
+lowest fitted joint: on the 60 s office take of 2026-09-29 it sits at **+0.07 m**
+with pitch 0, i.e. the level assumption is good to within a few cm at that
+distance — but that take was not recorded in the arena, so it validates the
+transform's height, not the 2.12 m offset.
+
+Stored data is untouched: `fit_body.py` still writes camera-frame `keypoints3d`,
+and the room frame is applied at display time only (`build_pose.py` would need one
+line to package room coordinates instead, if a model should ever predict them).
+
+`render_body_gif.py` now draws the rods, antennas and camera into the front, side
+and top views, and the top view shows the whole square rather than a crop around
+the person. `live_body.py` gained a live top-down panel beside the camera, fed by
+NLF's own 3-D joints — the one view that shows where in the array someone is
+standing, which is the geometry the links see.
+
+**NLF returns millimetres, `trans` metres.** Found on 2026-09-29 by the live
+top-down panel drawing nothing: `joints3d_nonparam` for a person 1.6 m away has a
+z median of 1639.9, while `trans[:, 2]` for the same frames reads 1.64. The room
+transform put the skeleton a kilometre away, off every panel. `extract_poses3d.py`
+now scales `joints3d`, `joints3d_nonparam` and `joint_uncertainties` by 1e-3 on the
+way into `<take>_nlf.npz`, which is what its own meta has always claimed. Nothing
+read those three arrays -- `fit_body.py` uses `pose`, `betas`, `trans`, `bbox` and
+`joints2d` -- so the fitted takes and the datasets are unaffected; `_nlf.npz` files
+written before today hold millimetres.
+
