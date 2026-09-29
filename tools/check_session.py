@@ -110,6 +110,14 @@ def check(path):
             probs.append(f'{gaps} frames dropped by the driver ({100 * gaps / len(ft):.0f}%)')
     if len(ft) > 1 and not np.all(np.diff(ft) > 0):
         probs.append('frame timestamps not monotonic')
+    want_fps = meta.get('fps_requested')
+    if want_fps and len(ft) > 10:
+        # Median step, so dropped frames do not count: a camera clock mapped onto the
+        # host at the wrong slope once stepped 36.7 ms for 2.4 s with no gap in the
+        # frame counter -- only this and the jump back at its end gave it away.
+        step_fps = 1.0 / float(np.median(np.diff(ft)))
+        if abs(step_fps / float(want_fps) - 1) > 0.05:
+            probs.append(f'frame timestamps step at {step_fps:.1f} fps, requested {want_fps}')
 
     lks = links(d)
     counts, worst_dt, widths = {}, 0.0, {}
@@ -197,7 +205,11 @@ def check(path):
     link_t = {}
     for lk in lks:
         tx, rx = lk.split('|')
-        link_t[f'{lab.get(tx, tx[-5:])}->{lab.get(rx, rx[-5:])}'] = d[f'{lk}|t']
+        # Board clock mapped to host time (tc) where recorded: it is what the
+        # recorder builds the windows from; host arrival (t) lags up to ~36 ms under
+        # load and reports empty windows the saved data does not have.
+        link_t[f'{lab.get(tx, tx[-5:])}->{lab.get(rx, rx[-5:])}'] = \
+            d[f'{lk}|tc'] if f'{lk}|tc' in d.files else d[f'{lk}|t']
     cover = frame_coverage(ft, link_t, sorted(want)) if want else float('nan')
     # and how many packets each link has per window: the minimum is the guarantee
     win_min = win_med = float('nan')
@@ -235,7 +247,8 @@ def check(path):
             n_empty = int(np.sum((wc == 0) & cells[None]))
             if n_empty:
                 probs.append(f'{n_empty} frame-link windows are empty (all-zero padding)')
-    elif 'frame_t' in d.files and any(k.endswith('|iq') for k in d.files):
+    elif 'frame_t' in d.files and any(k.endswith('|iq') for k in d.files) \
+            and not meta.get('raw'):
         probs.append('no saved CSI windows (win_iq) in an I/Q take')
 
     if not lks:

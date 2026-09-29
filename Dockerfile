@@ -33,6 +33,10 @@ RUN IDF_PATH_FORCE=1 . "$IDF_PATH/export.sh" && pip install --no-cache-dir \
     pyqtgraph \
     matplotlib \
     scipy \
-    statsmodels
+    statsmodels \
+    pyyaml \
+    pillow \
+    opencv-python-headless \
+    pyrealsense2
 
 WORKDIR /workspace

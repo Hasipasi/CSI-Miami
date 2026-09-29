@@ -20,6 +20,8 @@ services:
       - 'c 166:* rmw'
       - 'c 81:* rmw'
       - 'c 234:* rmw'
+      # USB bus (189): the pyrealsense2 wheel talks to the camera over libusb, not V4L2.
+      - 'c 189:* rmw'
     environment:
       - DISPLAY=${DISPLAY}
     stdin_open: true
@@ -38,6 +40,14 @@ services:
     volumes:
       - .:/workspace
       - ${CSI_DATA:-./data}:/workspace/data
+      # Live preview (tools/live_body.py) needs the camera and an X server; the
+      # batch targets ignore both.
+      - /dev:/dev
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    device_cgroup_rules:
+      - 'c 81:* rmw'
+      - 'c 189:* rmw'
+      - 'c 234:* rmw'
     # `runtime: nvidia` is the passthrough that works with nvidia-container-toolkit
     # as configured in /etc/docker/daemon.json; the CDI / `gpus:` route left CUDA
     # with "unknown error" on the 2026-09-17 workstation.
@@ -45,5 +55,6 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - DISPLAY=${DISPLAY}
     stdin_open: true
     tty: true

@@ -1,0 +1,45 @@
+# Capture protocol, 2026-09-17: the whole day's recording in one run.
+#
+# Same 6 takes as protocols/szept16, run as two blocks back to back:
+#   round-robin (8 rounds = 48 takes) -> pinned transmitter A (8 rounds = 48 takes)
+# The viewer switches the transmitter itself between blocks, and each block writes
+# to its own session dir, so the RR and txA sessions stay separate (they can never
+# share a dataset: 12 links vs 3). No train/test split in the dirs: split by round
+# suffix (right_wave0 ... idle7). 96 takes x 10 s + 10 s windup = ~16 min.
+#
+#   subject   appended to every session dir: gergo -> 260917_RR_gergo
+#   windup    extra seconds before the very first lead-in only
+#   rate      firmware ping rate for the block (Hz), pinned so a GUI preset click
+#             cannot change it. Omitted: the GUI's selected preset.
+#             RR 2000: 4 boards x 500 Hz, the setting measured 2026-09-17
+#             (12 ms token cycle, 8-12 packets per link per frame).
+#             txA 900: 2000 Hz pinned overruns the receivers' 3 Mbaud UART
+#             (measured 2026-09-17: 1159 Hz/link delivered, every other ping lost).
+subject: balazs
+windup: 10
+lead_in: 3
+duration: 7
+gap: 0
+
+blocks:
+  - {session: 260917_RR,  tx: round-robin, repeats: 8, rate: 2000}
+  - {session: 260917_txA, tx: A, repeats: 8, rate: 900}
+
+takes:
+  - name: right_wave
+    instruction: WAVE WITH RIGHT HAND - Integess a jobb kezeddel
+
+  - name: left_wave
+    instruction: WAVE WITH LEFT HAND - Integess a bal kezeddel
+
+  - name: stretch_horizontal
+    instruction: STRETCH HORIZONTAL — Melkas nyújtás
+
+  - name: hand_on_neck
+    instruction: HAND ON NECK - Kezek a tarkóra
+
+  - name: arms_forward
+    instruction: ARMS FORWARD — Nyújtsd ki előre a kezeidet
+
+  - name: idle
+    instruction: MOVE AROUND - Lépj a következő jelölőre

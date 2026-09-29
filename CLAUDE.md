@@ -25,6 +25,10 @@ python3 tools/capture.py --prefix take1 --seconds 60 [--mode fixedtx --tx A]
 # measure the round-robin schedule on the boards, no camera needed
 python3 tools/ring_sweep.py --points 1:400,2:400,0:400 --guard 1 [--band 5.6 --bw 40]
 
+# raw recording (--raw on either recorder): packets + colour + depth, no windows.
+# The windows are added wherever the data lands, not on the recording PC:
+python3 tools/finish_capture.py data/<session>        # raw -> full takes, in place
+
 # validate a session — always, before anyone trains on it
 python3 tools/check_session.py data/<session>
 

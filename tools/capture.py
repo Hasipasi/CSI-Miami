@@ -452,6 +452,21 @@ class MacCamera:
         self.cap.release()
 
 
+def start_realsense(pipe, cfg):
+    """pipe.start(cfg), but proven to deliver. After a process holding the camera is
+    killed (docker stop -> SIGKILL) the D435i's first start delivers nothing, forever,
+    and the GUI just sits at 0 fps; a stop/start recovers it (Linux rig, 2026-09-17)."""
+    prof = pipe.start(cfg)
+    try:
+        pipe.wait_for_frames(3000)
+    except RuntimeError:
+        print('RealSense gave no frames; restarting the pipeline', file=sys.stderr, flush=True)
+        pipe.stop()
+        prof = pipe.start(cfg)
+        pipe.wait_for_frames(5000)        # still nothing: fail loudly, not 0 fps
+    return prof
+
+
 class RealSenseCamera:
     """Colour AND depth from an Intel RealSense through librealsense (pyrealsense2).
 
@@ -485,7 +500,7 @@ class RealSenseCamera:
         cfg.enable_stream(rs.stream.color, int(w), int(h), rs.format.bgr8, int(round(fps)))
         cfg.enable_stream(rs.stream.depth, int(depth_w), int(depth_h), rs.format.z16,
                           int(round(fps)))
-        prof = self.pipe.start(cfg)
+        prof = start_realsense(self.pipe, cfg)
         dev = prof.get_device()
         serial = dev.get_info(rs.camera_info.serial_number)
         self.name = f'{dev.get_info(rs.camera_info.name)} {serial} (librealsense)'
@@ -507,6 +522,7 @@ class RealSenseCamera:
         self.wall_ts = True
         self.has_depth = True
         self.depth = None
+        self.depth_range = DEPTH_RANGE_M
         self.seq = 0
 
     def start(self):
@@ -520,16 +536,31 @@ class RealSenseCamera:
         except RuntimeError:
             return None           # timed out: the caller loops
         c = fs.get_color_frame()
-        if not c:
+        # The synced pipeline can hand back a frameset whose only new member is
+        # depth, still carrying the previous colour frame: returning it recorded
+        # the same image twice with a zero timestamp step (seen 2026-09-17).
+        if not c or int(c.get_frame_number()) == self.seq:
             return None
+        now = time.time()
         ts = c.get_timestamp() / 1000.0
-        if not 1e9 < ts < 4e9:    # not global time after all: stamp arrival
-            ts = time.time()
+        # Global time is the camera clock mapped onto the host's, and normally lands
+        # ~33 ms before arrival. Once (2026-09-17) the mapping ran 10% slow for 2.4 s
+        # and then jumped back 0.73 s -- every CSI window of those frames misplaced.
+        # Anything more than 250 ms from arrival is not a timestamp: stamp arrival.
+        if not 1e9 < ts < 4e9 or not -0.05 < now - ts < 0.25:
+            if 1e9 < ts < 4e9:
+                self.bad_ts = getattr(self, 'bad_ts', 0) + 1
+                if self.bad_ts in (1, 100, 1000):
+                    print(f'RealSense global timestamp {now - ts:+.3f} s from arrival '
+                          f'({self.bad_ts} frames); using arrival time',
+                          file=sys.stderr, flush=True)
+            ts = now
         # Copy: librealsense recycles the frame buffer once the frameset dies.
         buf = np.asanyarray(c.get_data()).copy()
         d = fs.get_depth_frame()
         if d:
-            self.depth = (np.asanyarray(d.get_data()).copy(), ts)
+            self.depth = (clip_depth(np.asanyarray(d.get_data()).copy(),
+                                     self.depth_scale, self.depth_range), ts)
             hook = getattr(self, 'on_depth', None)
             if hook is not None:
                 hook(self.depth[0], ts, int(d.get_frame_number()))
@@ -562,6 +593,23 @@ class RealSenseCamera:
 # Where depth_server.py (run as root on a Mac) offers the depth stream to the
 # unprivileged viewer and recorder.
 DEPTH_SOCKET = '/tmp/csi-depth.sock'
+
+
+def clip_depth(d, scale, rng):
+    """Depth units outside `rng` metres set to 0, the format's own "no reading"."""
+    if not rng:
+        return d
+    lo, hi = (int(round(v / max(scale, 1e-9))) for v in rng)
+    d[(d < lo) | (d > hi)] = 0
+    return d
+
+
+def set_depth_range(cam, spec):
+    """Apply a "near,far" (metres) command-line value to whatever camera opened."""
+    rng = tuple(float(x) for x in str(spec).split(',')) if spec else None
+    if rng and getattr(cam, 'has_depth', False):
+        cam.depth_range = rng
+    return rng
 
 
 def rs_colour_geometry(cs, ds):
@@ -707,7 +755,7 @@ class RealSenseDepth:
         self.pipe = rs.pipeline(ctx)
         cfg = rs.config()
         cfg.enable_stream(rs.stream.depth, int(w), int(h), rs.format.z16, int(round(fps)))
-        prof = self.pipe.start(cfg)
+        prof = start_realsense(self.pipe, cfg)
         dev = prof.get_device()
         self.depth_scale = float(dev.first_depth_sensor().get_depth_scale())
         ds = prof.get_stream(rs.stream.depth).as_video_stream_profile()
@@ -784,7 +832,8 @@ def camera_gt_meta(cam, gt):
     out = dict(gt=gt)
     if getattr(cam, 'has_depth', False):
         out.update(depth_scale_m=cam.depth_scale, depth_width=cam.depth_w,
-                   depth_height=cam.depth_h, depth_intrinsics=cam.depth_intrinsics)
+                   depth_height=cam.depth_h, depth_intrinsics=cam.depth_intrinsics,
+                   depth_range_m=list(getattr(cam, 'depth_range', None) or ()))
         for k in ('colour_intrinsics', 'depth_to_colour'):
             if getattr(cam, k, None):
                 out[k] = getattr(cam, k)
@@ -917,7 +966,9 @@ def default_camera_device():
     is the attached phone as often as not.
     """
     if sys.platform != 'darwin':
-        return find_colour_node()
+        # 'realsense', not the node path: open_camera only tries librealsense (and
+        # so --depth) for that name, and falls back to find_colour_node() itself.
+        return 'realsense'
     # A RealSense, if one is attached: through depth_server.py when that is running
     # (it holds the camera, so AVFoundation no longer lists it), else its colour
     # stream through AVFoundation.
@@ -934,7 +985,7 @@ def default_camera_device():
     return str(idx)
 
 
-def open_camera(dev, w, h, fps, depth=False):
+def open_camera(dev, w, h, fps, depth=False, depth_size=None):
     """A camera for `dev`, choosing the backend the device identifies.
 
     A path is a V4L2 node. A bare integer is an AVFoundation index, used as given so
@@ -954,7 +1005,10 @@ def open_camera(dev, w, h, fps, depth=False):
             # Linux: librealsense owns the whole camera (V4L2 nodes, udev rules).
             if depth:
                 try:
-                    return RealSenseCamera(w, h, fps)
+                    # 1280x720 and 848x480 give the stereo module its full 89.0 deg;
+                    # 640x480 is a 4:3 crop of that frame and keeps
+                    # only 78.6 deg horizontally.
+                    return RealSenseCamera(w, h, fps, *(depth_size or (640, 480)))
                 except (ImportError, RuntimeError) as e:
                     print(f'RealSense depth unavailable: {e} -- check the udev rules '
                           f'and that nothing else holds the camera. Colour only.',
@@ -1410,6 +1464,13 @@ class JpegWriter:
 # every take the same shape. A pinned transmitter delivers ~33 per link per
 # window (every ping goes to every receiver), hence 48 there. Overflow is counted
 # in meta, never silently dropped.
+# Depth outside this range is stored as 0 (= no reading). Nothing in the array is
+# further away than the far wall, and the sensor's own minimum is ~0.5 m, so
+# everything outside it is noise or the 65.535 m saturation value -- which is also
+# what made the depth PNGs 76% of a take (they compress badly). Full uint16
+# resolution is kept inside the range; this only drops readings, never rounds them.
+DEPTH_RANGE_M = (0.5, 6.0)
+
 WINDOW_SLOTS = 16
 WINDOW_SLOTS_PINNED = 48
 
@@ -1739,7 +1800,7 @@ def build_windows(out, links, meta, window_slots=WINDOW_SLOTS):
 
 
 def write_capture(prefix, recs, frames, t0, meta, own=None, depth_frames=None,
-                  window_slots=WINDOW_SLOTS):
+                  window_slots=WINDOW_SLOTS, raw=False):
     """Write one self-contained capture and return (path, report, frame times).
 
     Beside the per-link packet arrays, every take carries the per-frame CSI
@@ -1828,7 +1889,16 @@ def write_capture(prefix, recs, frames, t0, meta, own=None, depth_frames=None,
     meta = dict(meta)
     # Packet times on the boards' clocks, then the per-frame windows.
     meta['clock_offsets'] = board_clock_times(out, links_written)
-    overflow, pinned, half = build_windows(out, links_written, meta, window_slots)
+    if raw:
+        # Raw take: the packets, the frames and the depth as they were recorded.
+        # The per-frame windows are derived from exactly this and nothing during a
+        # session reads them, so they are built off the recording PC instead
+        # (tools/finish_capture.py) -- seconds per take that the operator waits
+        # for, spent on a machine nobody is standing in front of.
+        overflow, pinned, half = 0, None, None
+        meta['raw'] = True
+    else:
+        overflow, pinned, half = build_windows(out, links_written, meta, window_slots)
     # Drop the frames that are not a complete sample: no image on disk (the
     # encoder queue was full), no depth frame of their own, or a link missing from
     # their CSI window. The dropped images are removed with the rest.
@@ -2326,8 +2396,10 @@ class Recorder:
         self.prefix = resolve_prefix(args.prefix, args.outdir)
         self.frame_dir = f'{self.prefix}_frames'
         self.own = owner_of(self.prefix)
+        dw, dh = (int(x) for x in str(args.depth_size).lower().split('x'))
         self.cam = open_camera(args.device, args.width, args.height, args.fps,
-                               depth=args.depth)
+                               depth=args.depth, depth_size=(dw, dh))
+        set_depth_range(self.cam, args.depth_range)
         # What a take's frames are. 'both' (default): colour JPEGs with the depth
         # frames beside them. 'colour': colour alone. 'depth': the depth frames
         # are THE frames (16-bit PNGs under frames/, the CSI windows anchored on
@@ -2605,7 +2677,8 @@ class Recorder:
                     **camera_gt_meta(self.cam, 'depth' if self.depth_only else 'rgb'))
         path, report, ft = write_capture(self.prefix, self.recs, self.frames,
                                          self.t0, meta, self.own,
-                                         depth_frames=self.depth_frames if self.record_depth else None)
+                                         depth_frames=self.depth_frames if self.record_depth else None,
+                                         raw=getattr(self.args, 'raw', False))
         out = {'frame_seq': np.array([f[1] for f in self.frames], dtype=np.int64)}
         dur = ft[-1] - ft[0] if len(ft) > 1 else 0.0
         # Camera frame numbers, when the frames carry them; a stream without a
@@ -2709,10 +2782,29 @@ def main():
                     help='radio bandwidth at 5.6 GHz (the firmware enters 5.6 at 20 '
                          'MHz and is widened after); 117 complex subcarriers at 40')
     ap.add_argument('--quality', type=int, default=85)
+    # Raw is the default: a session should cost the operator nothing beyond the
+    # recording itself, and the windows are derived data (tools/finish_capture.py).
+    ap.add_argument('--raw', action='store_true', default=True,
+                    help=argparse.SUPPRESS)
+    ap.add_argument('--windows', dest='raw', action='store_false',
+                    help='also compute the per-frame CSI windows while recording '
+                         '(default: raw takes, finished later with finish_capture.py)')
+    ap.add_argument('--depth-size', default='1280x720',
+                    help='depth WxH. 1280x720 and 848x480 are the stereo module\'s '
+                         'full 89 deg; 640x480 is a crop, 78.6 deg wide')
+    ap.add_argument('--depth-range', default=','.join(str(v) for v in DEPTH_RANGE_M),
+                    help='near,far metres kept in the depth frames; outside is stored '
+                         'as no reading (default: %(default)s)')
     ap.add_argument('--depth', action='store_true',
                     help='open the RealSense through librealsense in this process '
                          '(Linux). On a Mac run tools/depth_server.py instead; its '
                          'colour + depth are taken automatically.')
+    # Depth on by default: colour+depth is what a take is for (3-D pose needs both).
+    # Not on macOS -- there librealsense needs root and crashes the interpreter
+    # unprivileged, so it stays opt-in and depth_server.py is the normal route.
+    ap.set_defaults(depth=sys.platform != 'darwin')
+    ap.add_argument('--no-depth', dest='depth', action='store_false',
+                    help='colour only; no depth stream')
     ap.add_argument('--frames', choices=('both', 'colour', 'depth'), default='both',
                     help='what a take\'s frames are: colour JPEGs with the depth frames '
                          'beside them (default; 3-D pose needs both), colour alone, or '

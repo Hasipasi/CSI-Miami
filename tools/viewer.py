@@ -64,11 +64,12 @@ from PyQt5.Qt import *
 from PyQt5 import QtCore
 import pyqtgraph as pg
 
-from capture import (BAUD, C5_MACS, SUB_INDEX, CsiStream, JpegWriter, LABEL,
+from capture import (BAUD, C5_MACS, DEPTH_RANGE_M, SUB_INDEX, CsiStream, JpegWriter, LABEL,
                      TokenRing, camera_gt_meta, default_camera_device,
                      default_outdir, derive_fields, discover, field_bounds,
                      frame_coverage, frame_half_window, frame_wall, open_camera, owner_of,
-                     parse_scan_line, rank_channels, resolve_prefix, write_capture)
+                     parse_scan_line, rank_channels, resolve_prefix, set_depth_range,
+                     write_capture)
 
 pg.setConfigOptions(imageAxisOrder='row-major')
 
@@ -290,11 +291,36 @@ def load_protocol(path):
     if dupes:
         raise ValueError(f'duplicate take names would overwrite each other: {sorted(dupes)}')
 
-    repeats = max(1, int(doc.get('repeats', 1)))
-    takes = ([(f'{n}{r}', ins) for r in range(repeats) for n, ins in base]
-             if repeats > 1 else list(base))
-    timing['repeats'] = repeats
+    timing['windup'] = float(doc.get('windup', 0))
+    # `subject: gergo` suffixes every session dir (260917_RR -> 260917_RR_gergo), so
+    # the same protocol serves each person without editing the block names.
+    subject = safe_name(str(doc['subject'])) if doc.get('subject') else None
+    timing['subject'] = subject
     timing['nbase'] = len(base)
+    # `blocks:` runs the take set several times over in one go, each block into its
+    # own session dir with its own transmitter (and optionally firmware rate), so a
+    # train+test, RR+pinned recording is one run for the subject. timing['blocks']
+    # is aligned with takes: the block each take belongs to.
+    blocks = doc.get('blocks') or [{'repeats': doc.get('repeats', 1)}]
+    takes, per_take = [], []
+    for b in blocks:
+        repeats = max(1, int(b.get('repeats', 1)))
+        info = dict(session=b.get('session'), tx=b.get('tx'), rate=b.get('rate'),
+                    repeats=repeats, subject=subject)
+        if info['tx'] is not None:
+            info['tx'] = str(info['tx'])
+        if info['session'] is not None:
+            info['session'] = safe_name(str(info['session']))
+            if subject:
+                info['session'] += f'_{subject}'
+        for r in range(repeats):
+            for n, ins in base:
+                takes.append((f'{n}{r}' if repeats > 1 else n, ins))
+                per_take.append(info)
+    names = [(i['session'], n) for (n, _), i in zip(takes, per_take)]
+    if len(set(names)) != len(names):
+        raise ValueError('two blocks write the same takes into one session dir')
+    timing['blocks'] = per_take
     return timing, takes
 
 
@@ -309,7 +335,7 @@ class Cue(QWidget):
         self.resize(1100, 720)
         lay = QVBoxLayout(self)
         self.step = QLabel('', alignment=QtCore.Qt.AlignCenter)
-        self.step.setStyleSheet('font-size: 30px; color: #dddddd;')
+        self.step.setStyleSheet('font-size: 90px; font-weight: bold; color: #dddddd;')
         self.head = QLabel('', alignment=QtCore.Qt.AlignCenter)
         self.head.setStyleSheet('font-size: 66px; font-weight: bold; color: white;')
         self.head.setWordWrap(True)
@@ -1303,16 +1329,40 @@ class Live(QWidget):
                 out.append(LABEL.get(m[-5:], m[-5:]))
         return sorted(out)
 
-    def session_dir(self):
+    def session_dir(self, block=None):
         """Takes from a protocol go in <outdir>/<yaml stem>/, so one session's files
-        stay together instead of scattering loose names across the data folder."""
-        return pathlib.Path(self.args.protocol).stem
+        stay together instead of scattering loose names across the data folder. A
+        block with its own `session` goes there instead."""
+        if block and block.get('session'):
+            return block['session']
+        stem = pathlib.Path(self.args.protocol).stem
+        subject = (block or {}).get('subject')
+        return f'{stem}_{subject}' if subject else stem
+
+    def apply_block(self, block):
+        """Put the radio in the block's configuration before its first lead-in."""
+        tx = block.get('tx')
+        if tx is not None and tx != self.tx_sel:
+            if tx not in self.tx_buttons:
+                raise ValueError(f'protocol block tx {tx!r}: no such board')
+            self.tx_buttons[tx].setChecked(True)
+            self.set_tx(tx)
+        if block.get('rate'):
+            self.send_rate(int(block['rate']))
+        else:
+            self.apply_rate_preset(force=True)
 
     def show_protocol(self):
         if self.args.protocol:
+            try:
+                blocks = load_protocol(self.args.protocol)[0]['blocks']
+                dirs = list(dict.fromkeys(self.session_dir(b) for b in blocks))
+            except (OSError, ValueError) as e:
+                self.proto_label.setText(f'<span style="color:#d03b3b">{e}</span>')
+                return
             self.proto_label.setText(
                 f'protocol <b>{os.path.basename(self.args.protocol)}</b> → '
-                f'{self.args.outdir}/{self.session_dir()}/')
+                f'{self.args.outdir}/' + ', '.join(f'{d}/' for d in dirs))
         else:
             self.proto_label.setText('no protocol chosen — press "Protocol…" to pick one')
         self.rec_status.setText(f'idle · manual takes save to {self.args.outdir}/')
@@ -1361,8 +1411,14 @@ class Live(QWidget):
         except (OSError, ValueError) as e:
             self.rec_status.setText(f'<span style="color:#d03b3b">protocol: {e}</span>')
             return
+        blocks = timing['blocks']
+        bad = [b['tx'] for b in blocks if b['tx'] is not None and b['tx'] not in self.tx_buttons]
+        if bad:
+            self.rec_status.setText(f'<span style="color:#d03b3b">protocol: unknown tx {bad}</span>')
+            return
+        self.apply_block(blocks[0])
         self.proto = dict(timing=timing, takes=takes, i=0, phase=LEAD,
-                          until=time.time() + timing['lead_in'])
+                          until=time.time() + timing['windup'] + timing['lead_in'])
         self.cue = Cue()
         self.cue.show()
         self.cue.raise_()
@@ -1417,7 +1473,7 @@ class Live(QWidget):
 
         if left <= 0:
             if p['phase'] == LEAD:
-                self.start_record(f'{self.session_dir()}/{name}')
+                self.start_record(f'{self.session_dir(t["blocks"][p["i"]])}/{name}')
                 p['phase'], p['until'] = REC, now + t['duration']
             elif p['phase'] == REC:
                 self.stop_record()
@@ -1427,14 +1483,20 @@ class Live(QWidget):
                 if p['i'] >= len(p['takes']):
                     return self.abort_protocol(
                         f'finished — {len(p["takes"])} takes captured')
+                if t['blocks'][p['i']] is not t['blocks'][p['i'] - 1]:
+                    self.apply_block(t['blocks'][p['i']])
                 p['phase'], p['until'] = LEAD, now + t['lead_in']
             name, instruction = p['takes'][p['i']]
             left = p['until'] - now
 
-        step = f'take {p["i"] + 1} of {len(p["takes"])}'
-        if t['repeats'] > 1:
-            step += f'   ·   round {p["i"] // int(t["nbase"]) + 1}/{int(t["repeats"])}'
-        step += f'   ·   {name}'
+        # The subject only needs how far along the whole run is; take/round/session
+        # detail is in the operator's GUI status line ("take right_wave3 captured").
+        per_take = t['lead_in'] + t['duration'] + t['gap']
+        rest_of_take = {LEAD: t['duration'] + t['gap'], REC: t['gap']}.get(p['phase'], 0.0)
+        remain = int(np.ceil(max(left, 0) + rest_of_take
+                             + (len(p['takes']) - p['i'] - 1) * per_take))
+        step = (f'{100 * p["i"] // len(p["takes"])}%   ·   '
+                f'{remain // 60}:{remain % 60:02d} left')
         nxt = (p['takes'][p['i'] + 1][0] if p['i'] + 1 < len(p['takes']) else 'finish')
         if p['phase'] == LEAD:
             self.cue.show_state(LEAD, step, instruction, left, 'GET READY — recording starts at 0')
@@ -1608,7 +1670,8 @@ class Live(QWidget):
                                           if rec['depth_jpeg'] is not None else 0))
         path, report, ft = write_capture(rec['prefix'], recs, frames,
                                          rec['t0'], meta, rec['own'],
-                                         depth_frames=depth_frames)
+                                         depth_frames=depth_frames,
+                                         raw=getattr(self.args, 'raw', False))
         dur = ft[-1] - ft[0] if len(ft) > 1 else 0.0
         npkt = sum(len(v) for v in recs.values())
         msg = (f'wrote <b>{path}</b> · {len(ft)} frames '
@@ -2150,7 +2213,10 @@ class Live(QWidget):
                 for m in self.macs:
                     if m != tx:
                         self.boards[m].write(f'RX {tx.replace(":", "")}\n'.encode())
-                self.boards[tx].write(b'TX\n')
+                # Park it first: RX clears the round-robin turns it was already
+                # scheduled, plain TX does not, and the first of those to finish
+                # ends the pinned transmission for good (all links silent).
+                self.boards[tx].write(b'RX 000000000000\nTX\n')
         except (serial.SerialException, OSError):
             return False
         self.ring.disarm()      # the receiver lists were just overwritten
@@ -2685,11 +2751,30 @@ def main():
                     help='what a take\'s frames are: colour JPEGs with depth PNGs '
                          'beside them (default; 3-D pose needs both), colour alone, '
                          'or depth alone. Switchable in the GUI between takes.')
+    # Raw is the default: a session should cost the operator nothing beyond the
+    # recording itself, and the windows are derived data (tools/finish_capture.py).
+    ap.add_argument('--raw', action='store_true', default=True,
+                    help=argparse.SUPPRESS)
+    ap.add_argument('--windows', dest='raw', action='store_false',
+                    help='also compute the per-frame CSI windows while recording '
+                         '(default: raw takes, finished later with finish_capture.py)')
+    ap.add_argument('--depth-size', default='1280x720',
+                    help='depth WxH. 1280x720 and 848x480 are the stereo module\'s '
+                         'full 89 deg; 640x480 is a crop, 78.6 deg wide')
+    ap.add_argument('--depth-range', default=','.join(str(v) for v in DEPTH_RANGE_M),
+                    help='near,far metres kept in the depth frames; outside is stored '
+                         'as no reading (default: %(default)s)')
     ap.add_argument('--depth', action='store_true',
                     help='open the RealSense depth stream in this process through '
                          'librealsense. Not needed when tools/depth_server.py is '
                          'running (the normal way on a Mac, where librealsense needs '
                          'root): its depth stream is attached automatically.')
+    # Depth on by default: colour+depth is what a take is for (3-D pose needs both).
+    # Not on macOS -- there librealsense needs root and crashes the interpreter
+    # unprivileged, so it stays opt-in and depth_server.py is the normal route.
+    ap.set_defaults(depth=sys.platform != 'darwin')
+    ap.add_argument('--no-depth', dest='depth', action='store_false',
+                    help='colour only; no depth stream')
     ap.add_argument('--prefix', default='run', help='default capture name in the GUI')
     ap.add_argument('--outdir', default=None,
                     help='directory for captures (default: the repo data/ folder)')
@@ -2745,7 +2830,10 @@ def main():
         print(f'note: {", ".join(missing)} not connected; recording {n_links} of '
               f'{len(expected) * (len(expected) - 1)} links', flush=True)
 
-    cam = open_camera(dev, args.width, args.height, args.fps, depth=args.depth)
+    dw, dh = (int(x) for x in str(args.depth_size).lower().split('x'))
+    cam = open_camera(dev, args.width, args.height, args.fps, depth=args.depth,
+                      depth_size=(dw, dh))
+    set_depth_range(cam, args.depth_range)
     print(f'camera {cam.name} {cam.w}x{cam.h} @ {cam.fps:g} fps', flush=True)
     # The ring thread competes with the encoders, the camera threads and the GUI
     # for the interpreter lock; switch ten times as often as Python's default 5 ms

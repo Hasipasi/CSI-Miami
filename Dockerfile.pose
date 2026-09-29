@@ -15,6 +15,16 @@ RUN pip install --no-cache-dir \
     numpy scipy pillow opencv-python-headless matplotlib pyyaml \
     ultralytics
 
+# Live preview only (tools/live_body.py): the camera and a Qt window, so one
+# process can run the RealSense and NLF together. Separate layer: the torch install
+# above is ~5 GB and must stay cached.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libegl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+    libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxcb-shape0 \
+    libxcb-cursor0 libsm6 libice6 libdbus-1-3 libfontconfig1 libusb-1.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir pyrealsense2 PyQt5 pyserial
+
 # Config/cache dirs that work for a non-root `user:` in docker-compose.
 ENV HOME=/tmp MPLCONFIGDIR=/tmp/mpl YOLO_CONFIG_DIR=/tmp/yolo TRITON_CACHE_DIR=/tmp/triton \
     TORCHINDUCTOR_CACHE_DIR=/tmp/inductor TORCH_HOME=/workspace/models/torch PYTHONUNBUFFERED=1
