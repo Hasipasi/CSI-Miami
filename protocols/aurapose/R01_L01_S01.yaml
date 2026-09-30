@@ -1,0 +1,48 @@
+windup: 10
+lead_in: 2
+duration: 3
+gap: 0
+
+blocks:
+  - {session: R01_L01_S01/RR,  tx: round-robin, repeats: 8, rate: 2000}
+  - {session: R01_L01_S01/txA, tx: A, repeats: 8, rate: 900}
+
+takes:
+  - name: wave
+    instruction: WAVE (either hand) - Integess (bármelyik kézzel)
+
+  - name: stretch_horizontal
+    instruction: STRETCH HORIZONTAL - Karok vízszintesen
+
+  - name: stretch_vertical
+    instruction: STRETCH VERTICAL - Karok a fej fölé
+
+  - name: knee_raises
+    instruction: KNEE RAISES - Térdemelés
+
+  - name: jump
+    instruction: JUMP ONCE - Ugorj egyszer
+
+  - name: squat
+    instruction: SQUAT ONCE - Guggolj egyszer
+
+  - name: punch
+    instruction: QUICK PUNCH ONCE - Gyorsan üss
+
+  - name: slap
+    instruction: QUICK SLAP ONCE - Gyorsan pofozz
+
+  - name: free_gesture
+    instruction: SHOW US A GESTURE (NOT FROM THE LIST) - Mutass egy gesztust (a listán nem szereplőt)
+
+  - name: bow
+    instruction: BOW ONCE - Hajolj meg egyszer
+
+  - name: idle
+    instruction: STAND STILL - Állj egyhelyben
+
+  - name: walk_around
+    instruction: WALK AROUND - Sétálj körbe
+
+  - name: step_aside
+    instruction: STEP ASIDE AND STAY THERE - Lépj arrébb, és maradj ott

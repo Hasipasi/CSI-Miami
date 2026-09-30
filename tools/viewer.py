@@ -310,7 +310,10 @@ def load_protocol(path):
         if info['tx'] is not None:
             info['tx'] = str(info['tx'])
         if info['session'] is not None:
-            info['session'] = safe_name(str(info['session']))
+            # A session may name a sub-folder (R01_L01_S01/RR): each path component is
+            # sanitised on its own, so both blocks of one subject share a parent folder.
+            info['session'] = '/'.join(safe_name(c) for c in str(info['session']).split('/')
+                                       if c.strip() and c.strip() not in ('.', '..'))
             if subject:
                 info['session'] += f'_{subject}'
         for r in range(repeats):
